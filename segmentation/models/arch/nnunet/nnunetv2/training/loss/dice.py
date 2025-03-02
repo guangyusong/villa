@@ -115,7 +115,7 @@ class SoftDiceLoss(nn.Module):
 
 class MemoryEfficientSoftDiceLoss(nn.Module):
     def __init__(self, apply_nonlin: Callable = None, batch_dice: bool = False, do_bg: bool = True, smooth: float = 1.,
-                 ddp: bool = True):
+                 ddp: bool = True, reduction: str = "mean"):
         """
         saves 1.6 GB on Dataset017 3d_lowres
         """
@@ -126,7 +126,8 @@ class MemoryEfficientSoftDiceLoss(nn.Module):
         self.apply_nonlin = apply_nonlin
         self.smooth = smooth
         self.ddp = ddp
-
+        self.reduction = reduction
+        
     def forward(self, x, y, loss_mask=None):
         if self.apply_nonlin is not None:
             x = self.apply_nonlin(x)
@@ -173,13 +174,14 @@ class MemoryEfficientSoftDiceLoss(nn.Module):
 
         dc = (2 * intersect + self.smooth) / (torch.clip(sum_gt + sum_pred + self.smooth, 1e-8))
 
-        dc = dc.mean()
+        if self.reduction == "mean":
+            dc = dc.mean()
         return -dc
 
 
 class SoftSkeletonRecallLoss(nn.Module):
     def __init__(self, apply_nonlin: Callable = None, batch_dice: bool = False, do_bg: bool = True, smooth: float = 1.,
-                 ddp: bool = True):
+                 ddp: bool = True, reduction: str = "mean"):
         """
         saves 1.6 GB on Dataset017 3d_lowres
         """
@@ -191,6 +193,7 @@ class SoftSkeletonRecallLoss(nn.Module):
         self.apply_nonlin = apply_nonlin
         self.smooth = smooth
         self.ddp = ddp
+        self.reduction = reduction
 
     def forward(self, x, y, loss_mask=None):
         shp_x, shp_y = x.shape, y.shape
@@ -230,7 +233,9 @@ class SoftSkeletonRecallLoss(nn.Module):
 
         rec = (inter_rec + self.smooth) / (torch.clip(sum_gt+self.smooth, 1e-8))
 
-        rec = rec.mean()
+        if self.reduction == "mean":
+            rec = rec.mean()
+            
         return -rec
 
 

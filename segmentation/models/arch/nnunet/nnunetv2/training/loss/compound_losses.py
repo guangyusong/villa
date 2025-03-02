@@ -236,7 +236,7 @@ class DC_and_Focal_loss(nn.Module):
 
 class DC_SkelREC_and_CE_loss(nn.Module):
     def __init__(self, soft_dice_kwargs, soft_skelrec_kwargs, ce_kwargs, weight_ce=1, weight_dice=1, weight_srec=1,
-                 ignore_label=None, dice_class=MemoryEfficientSoftDiceLoss):
+                 ignore_label=None, dice_class=MemoryEfficientSoftDiceLoss, ce_class=RobustCrossEntropyLoss):
         """
         Weights for CE and Dice do not need to sum to one. You can set whatever you want.
         :param soft_dice_kwargs:
@@ -256,7 +256,7 @@ class DC_SkelREC_and_CE_loss(nn.Module):
         self.weight_srec = weight_srec
         self.ignore_label = ignore_label
 
-        self.ce = RobustCrossEntropyLoss(**ce_kwargs)
+        self.ce = ce_class(**ce_kwargs)
         self.dc = dice_class(apply_nonlin=softmax_helper_dim1, **soft_dice_kwargs)
         self.srec = SoftSkeletonRecallLoss(apply_nonlin=softmax_helper_dim1, **soft_skelrec_kwargs)
 
@@ -286,11 +286,15 @@ class DC_SkelREC_and_CE_loss(nn.Module):
             if self.weight_dice != 0 else 0
         srec_loss = self.srec(net_output, target_skel, loss_mask=mask) \
             if self.weight_srec != 0 else 0
-        ce_loss = self.ce(net_output, target[:, 0]) \
+
+        #print(net_output.shape, target.shape)
+        #ce_loss = self.ce(net_output, target[:,0]) \
+        ce_loss = self.ce(net_output, target[:,0]) \
             if self.weight_ce != 0 and (self.ignore_label is None or num_fg > 0) else 0
 
         result = self.weight_ce * ce_loss + self.weight_dice * dc_loss + self.weight_srec * srec_loss
         return result
+    
 class CL_and_DC_and_CE_loss(nn.Module):
     def __init__(self, soft_dice_kwargs, ce_kwargs, ignore_label=None,
                  dice_class=SoftDiceLoss, cldice_version="legacy"):

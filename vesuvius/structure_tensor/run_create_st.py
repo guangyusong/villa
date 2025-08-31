@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#run_create_st.py
 """
 Run script for vesuvius.create_st - handles multi-GPU orchestration
 """
@@ -18,7 +18,7 @@ import numpy as np
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from data.utils import open_zarr
-
+from numcodecs import Blosc
 
 def get_available_gpus():
     """Returns a list of available GPU IDs."""
@@ -81,15 +81,15 @@ def create_shared_output_store(args, input_shape, patch_size):
     
     # Get compressor
     if args.zarr_compressor.lower() == 'zstd':
-        compressor = zarr.Blosc(cname='zstd', clevel=args.zarr_compression_level, shuffle=zarr.Blosc.SHUFFLE)
+        compressor = Blosc(cname='zstd', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
     elif args.zarr_compressor.lower() == 'lz4':
-        compressor = zarr.Blosc(cname='lz4', clevel=args.zarr_compression_level, shuffle=zarr.Blosc.SHUFFLE)
+        compressor = Blosc(cname='lz4', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
     elif args.zarr_compressor.lower() == 'zlib':
-        compressor = zarr.Blosc(cname='zlib', clevel=args.zarr_compression_level, shuffle=zarr.Blosc.SHUFFLE)
+        compressor = Blosc(cname='zlib', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
     elif args.zarr_compressor.lower() == 'none':
         compressor = None
     else:
-        compressor = zarr.Blosc(cname='zstd', clevel=1, shuffle=zarr.Blosc.SHUFFLE)
+        compressor = Blosc(cname='zstd', clevel=1, shuffle=Blosc.SHUFFLE)
     
     print(f"Creating shared output store at: {main_store_path}")
     print(f"Full volume shape: {output_shape}")
@@ -158,8 +158,11 @@ def run_structure_tensor_part(args, part_id, gpu_id, shared_output_path):
         cmd.append('--structure-tensor-only')
     if args.volume is not None:
         cmd.extend(['--volume', str(args.volume)])
-    if args.swap_eigenvectors:
-        cmd.append('--swap-eigenvectors')
+    # Always compute structure tensor only in child processes; eigenanalysis runs once later.
+    # Ensure we only append once.
+    if '--structure-tensor-only' not in cmd:
+        cmd.append('--structure-tensor-only')
+    # (swap-eigenvectors applies to eigenanalysis stage; keep it for the later call.)
     # Set overlap to 0.0 for no overlap
     cmd.extend(['--overlap', '0.0'])
     
@@ -221,9 +224,12 @@ def run_eigenanalysis(zarr_path, chunk_size, compressor, verbose, swap_eigenvect
         cmd.append('--swap-eigenvectors')
     
     # Compression settings
-    cmd.extend(['--zarr-compressor', compressor.cname if hasattr(compressor, 'cname') else 'zstd'])
-    if hasattr(compressor, 'clevel'):
-        cmd.extend(['--zarr-compression-level', str(compressor.clevel)])
+    if compressor is None:
+        cmd.extend(['--zarr-compressor', 'none'])
+    else:
+        cmd.extend(['--zarr-compressor', compressor.cname])
+        if hasattr(compressor, 'clevel'):
+            cmd.extend(['--zarr-compression-level', str(compressor.clevel)])
     
     cmd.extend(['--num-workers', str(num_workers)])
     
@@ -340,6 +346,10 @@ def parse_arguments():
 def main():
     args = parse_arguments()
     
+    shared_output_path = None  # always initialize
+    structure_tensor_output = None  # path used by epilogue for eigenanalysis/cleanup
+    # (single-GPU -> output_path; multi-GPU -> shared_output_path)
+
     # Validation for eigenanalysis mode
     if args.mode == 'eigenanalysis':
         if not args.eigen_input:
@@ -348,15 +358,15 @@ def main():
     
     # Get compressor for later use
     if args.zarr_compressor.lower() == 'zstd':
-        compressor = zarr.Blosc(cname='zstd', clevel=args.zarr_compression_level, shuffle=zarr.Blosc.SHUFFLE)
+        compressor = Blosc(cname='zstd', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
     elif args.zarr_compressor.lower() == 'lz4':
-        compressor = zarr.Blosc(cname='lz4', clevel=args.zarr_compression_level, shuffle=zarr.Blosc.SHUFFLE)
+        compressor = Blosc(cname='lz4', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
     elif args.zarr_compressor.lower() == 'zlib':
-        compressor = zarr.Blosc(cname='zlib', clevel=args.zarr_compression_level, shuffle=zarr.Blosc.SHUFFLE)
+        compressor = Blosc(cname='zlib', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
     elif args.zarr_compressor.lower() == 'none':
         compressor = None
     else:
-        compressor = zarr.Blosc(cname='zstd', clevel=1, shuffle=zarr.Blosc.SHUFFLE)
+        compressor = Blosc(cname='zstd', clevel=1, shuffle=Blosc.SHUFFLE)
     
     # Parse chunk size for eigenanalysis if provided
     chunk_size_str = None
@@ -492,10 +502,33 @@ def main():
             if success:
                 print(f"\n--- Structure Tensor Processing Completed Successfully ---")
                 print(f"Output saved to: {output_path}")
+                
             else:
                 print(f"\n--- Structure Tensor Processing Failed ---")
                 return 1
     
+    # If we computed STs and the user did NOT request structure-tensor-only, run eigenanalysis now
+    if args.mode == 'structure-tensor' and not args.structure_tensor_only:
+        zarr_path = shared_output_path or structure_tensor_output
+        if not zarr_path:
+            print("Error: No structure tensor output path available for eigenanalysis.")
+            return 1
+        ok = run_eigenanalysis(
+            zarr_path=zarr_path,
+            chunk_size=chunk_size_str,
+            compressor=compressor,
+            verbose=args.verbose,
+            swap_eigenvectors=args.swap_eigenvectors,
+            num_workers=args.num_workers,
+        )
+        if not ok:
+            return 1
+        if args.delete_intermediate:
+            delete_intermediate_file(zarr_path, verbose=args.verbose)
+        print("\n--- All computations completed successfully ---")
+        print(f"  - Structure tensor: {zarr_path}/structure_tensor")
+        print(f"  - Eigenvectors: {zarr_path}/eigenvectors")
+        print(f"  - Eigenvalues:  {zarr_path}/eigenvalues")
     return 0
 
 

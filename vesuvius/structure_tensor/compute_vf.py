@@ -1,8 +1,13 @@
-#!/usr/bin/env python3
+#compute_vf.py
 import argparse
 import torch
 import zarr
-from create_vf import VectorFieldComputer
+from numcodecs import Blosc
+try:
+    # When executed as a module: python -m structure_tensor.compute_vf
+    from .create_vf import VectorFieldComputer
+except ImportError:  # Fallback when run as a loose script
+    from create_vf import VectorFieldComputer
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -40,6 +45,20 @@ def parse_args():
         '--clevel', type=int, default=3,
         help="Blosc compression level (default 3)"
     )
+    p.add_argument('--ome-u8', action='store_true',
+                   help="Write OME-ish uint8 layout (group/{z,y,x}/scale).")
+    p.add_argument('--ome-only', action='store_true',
+                   help="Write only the OME-ish layout, skip float U/V/N.")
+    p.add_argument('--group-name', default='horizontal',
+                   help="Top-level semantic group name (default: horizontal).")
+    p.add_argument('--scale', default='0',
+                   help="Scale name (string) for OME-ish datasets (default: 0).")
+    p.add_argument('--downsample', type=int, default=1,
+                   help="Integer downsample factor for OME-ish output (pick every Nth voxel).")
+    p.add_argument('--write-confidence', action='store_true',
+                   help="Also write a scalar confidence group in uint8.")
+    p.add_argument('--export-field', default='V', choices=['U','V','N','u','v','n'],
+                   help="Which vector to export to OME-ish layout (default: V).")
     return p.parse_args()
 
 def main():
@@ -54,10 +73,10 @@ def main():
     # parse chunk size
     cz, cy, cx = map(int, args.chunk_size.split(','))
 
-    compressor = zarr.Blosc(
+    compressor = Blosc(
         cname=args.cname,
         clevel=args.clevel,
-        shuffle=zarr.Blosc.SHUFFLE
+        shuffle=Blosc.SHUFFLE
     )
 
     # set up device
@@ -73,7 +92,14 @@ def main():
     computer.compute_fields_zarr(
         output_zarr=args.output_zarr,
         chunk_size=(cz, cy, cx),
-        compressor=compressor
+        compressor=compressor,
+        ome_u8=args.ome_u8 or args.ome_only,
+        group_name=args.group_name,
+        output_downsample=args.downsample,
+        output_ome_scale=args.scale,
+        write_confidence=args.write_confidence,
+        ome_only=args.ome_only,
+        export_field=args.export_field,
     )
 
 if __name__ == '__main__':

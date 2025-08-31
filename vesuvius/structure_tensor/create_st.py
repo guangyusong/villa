@@ -1,10 +1,10 @@
 #create_st.py
 import argparse
-import shutil
+import cupy as cp
+from cupyx.scipy import ndimage as ndi 
 import torch
 from torch import nn
 import torch.nn.functional as F
-import fsspec
 import numpy as np
 import os
 import subprocess
@@ -235,8 +235,8 @@ class StructureTensorInferer(Inferer, nn.Module):
     def compute_structure_tensor(self, x: torch.Tensor, sigma=None):
         # x: [N,1,Z,Y,X]
         if sigma is None: sigma = self.sigma
-        if sigma > 0:
-            x = F.conv3d(x, self._gauss3d, padding=(self._pad,)*3)
+        #if sigma > 0:
+        #    x = F.conv3d(x, self._gauss3d, padding=(self._pad,)*3)
 
         # 2) apply Pavel
         gz = F.conv3d(x, self.pavel_kz, padding=(4,2,2))
@@ -439,7 +439,7 @@ class ChunkDataset(Dataset):
 # solve the eigenvalue problem and sanitize the output
 def _eigh_and_sanitize(M: torch.Tensor):
     # 1) enforce symmetry (numerically more stable? M is already symmetrical)
-    M = 0.5 * (M + M.transpose(-1, -2))
+    # M = 0.5 * (M + M.transpose(-1, -2))
 
     # --- sanitize INPUT before eigh to avoid NaN/Inf failures ---
     M = torch.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0)
@@ -553,6 +553,9 @@ def _finalize_structure_tensor_torch(
         overwrite=True
     )
 
+    eigenvectors_arr.attrs['layout'] = 'eigenvectors[vector, component, z, y, x]'
+    eigenvectors_arr.attrs['description'] = 'Right-handed orthonormal basis sorted by eigenvalue magnitude'
+    eigenvectors_arr.attrs['swapped_0_1'] = bool(swap_eigenvectors)
     # prepare eigenvalues group
     eigenvalues_arr = root_store.create_dataset(
         'eigenvalues',
@@ -563,7 +566,9 @@ def _finalize_structure_tensor_torch(
         write_empty_chunks=False,
         overwrite=True
     )
-    
+    eigenvalues_arr.attrs['layout'] = 'eigenvalues[index, z, y, x]'
+    eigenvalues_arr.attrs['description'] = 'Eigenvalues sorted ascending (λ0 ≤ λ1 ≤ λ2)'
+
     # build chunk list
     def gen_bounds():
         for z0 in range(0, Z, cz):

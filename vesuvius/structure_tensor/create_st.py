@@ -1,10 +1,17 @@
+#create_st.py
 import argparse
-import cupy as cp
-from cupyx.scipy import ndimage as ndi 
+import shutil
 import torch
 from torch import nn
 import torch.nn.functional as F
+import fsspec
 import numpy as np
+import os
+import subprocess
+import time
+import traceback
+from pathlib import Path
+from typing import Optional, Union
 from tqdm.auto import tqdm
 from torch.utils.data import Dataset, DataLoader
 import zarr
@@ -12,7 +19,7 @@ import numcodecs
 
 from models.run.inference import Inferer
 from data.utils import open_zarr
-
+from numcodecs import Blosc
 
 class StructureTensorInferer(Inferer, nn.Module):
     """
@@ -74,8 +81,9 @@ class StructureTensorInferer(Inferer, nn.Module):
             g3 = g1[:, None, None] * g1[None, :, None] * g1[None, None, :]
             # store both kernel and pad:
             self.register_buffer("_gauss3d",   g3[None,None])     # [1,1,D,H,W]
-            self.register_buffer("_gauss3d_tensor",
-                                 self._gauss3d.expand(6, -1, -1, -1, -1))
+            self.register_buffer(
+                "_gauss3d_tensor",
+                self._gauss3d.expand(6, 1, -1, -1, -1).contiguous())
             self._pad = radius
         else:
             # no Gaussian padding when σ=0
@@ -227,8 +235,8 @@ class StructureTensorInferer(Inferer, nn.Module):
     def compute_structure_tensor(self, x: torch.Tensor, sigma=None):
         # x: [N,1,Z,Y,X]
         if sigma is None: sigma = self.sigma
-        #if sigma > 0:
-        #    x = F.conv3d(x, self._gauss3d, padding=(self._pad,)*3)
+        if sigma > 0:
+            x = F.conv3d(x, self._gauss3d, padding=(self._pad,)*3)
 
         # 2) apply Pavel
         gz = F.conv3d(x, self.pavel_kz, padding=(4,2,2))
@@ -357,74 +365,28 @@ class StructureTensorInferer(Inferer, nn.Module):
                     ya, yb = max(y0 - py, 0), min(y1 + py, vol_Y)
                     xa, xb = max(x0 - px, 0), min(x1 + px, vol_X)
 
-                    # --- dynamic slicing if no channel axis
+                    # --- robust channel handling: ensure [1,1,Z,Y,X] for conv3d ---
                     if input_src.ndim == 3:
-                    #    raw = input_src[2000:2128, 2000:2128, 2000:2128].astype('float32')
-                        raw = input_src[za:zb, ya:yb, xa:xb].astype('float32')
+                        raw = input_src[za:zb, ya:yb, xa:xb].astype('float32')              # [Z,Y,X]
                     else:
-                    #    raw = input_src[:, 2000:2128, 2000:2128, 2000:2128].astype('float32')
-                        raw = input_src[:, za:zb, ya:yb, xa:xb].astype('float32')
+                        # pick first channel (or replace with mean over channels if desired)
+                        raw = input_src[0, za:zb, ya:yb, xa:xb].astype('float32')           # [Z,Y,X]
+                    x = torch.from_numpy(raw).to(self.device).unsqueeze(0).unsqueeze(0)     # [1,1,Z,Y,X]
                     # ---
-
-                    data = torch.from_numpy(raw).to(self.device)
 
                     # Apply fiber-volume mask if needed
                     if self.volume is not None:
-                        masked = (data == self.volume)
-                    else:
-                        masked = data > 0
-
-                    # Convert PyTorch CUDA tensor to CuPy array without moving to CPU
-                    data_gpu = cp.asarray(masked.contiguous())
-
-                    # Apply EDT on GPU
-                    edt = ndi.distance_transform_edt(data_gpu)
-                    #print("EDT min/max:", edt.min(), edt.max())
-                    #print("Unique values (truncated):", cp.unique(edt)[:10])
-                    # Convert back to PyTorch CUDA tensor
-                    x = (
-                        torch.as_tensor(edt, device=self.device)  # [Z,Y,X] on GPU
-                            .float()
-                            .unsqueeze(0)  # Add channel dim
-                            .unsqueeze(0)  # Add batch dim
-                    )
-
-                    ### Visualization
-                    '''
-                    if i == 0:  # only visualize the first patch
-                        import napari
-                        viewer = napari.Viewer()
-                        # === (3) Pre-Gaussian smoothed version
-                        edt_torch = torch.as_tensor(edt, device=self.device)
-                        if self.sigma > 0:
-                            smoothed = F.conv3d(
-                                edt_torch[None, None, ...].float(),
-                                self._gauss3d, padding=(self._pad,)*3
-                            ).squeeze()
-                            pre_smooth = F.conv3d(
-                                masked[None, None, ...].float(),
-                                self._gauss3d, padding=(self._pad,)*3
-                            ).squeeze()
-                        else:
-                            smoothed = edt_torch
-                            pre_smooth = masked
-                        viewer.add_image(raw.squeeze(), name='Raw', colormap='gray')
-                        viewer.add_image(masked.float().squeeze().cpu(), name='Mask == volume')
-                        viewer.add_image(pre_smooth.squeeze().cpu(), name='Gaussian Smoothed PRE-EDT')
-                        viewer.add_image(cp.asnumpy(edt), name='Distance Transform', contrast_limits=[0, edt.max().get()])
-                        viewer.add_image(smoothed.squeeze().cpu(), name='Gaussian Smoothed EDT')
-                        napari.run()'''
+                        x = (x == float(self.volume)).float()
 
                     # Compute over padded patch
                     with torch.no_grad():
                         Jp = self.compute_structure_tensor(x, sigma=self.sigma)
                         # Jp shape: [1, 6, Zp, Yp, Xp]
 
-                    # Trim off the padding to recover exactly the original patch size
-                    tz0, ty0, tx0 = pz, py, px
-                    tz1 = tz0 + self.patch_size[0]
-                    ty1 = ty0 + self.patch_size[1]
-                    tx1 = tx0 + self.patch_size[2]
+                    # Border-aware trim to exactly the original patch extents
+                    tz0 = z0 - za; tz1 = tz0 + (z1 - z0)
+                    ty0 = y0 - ya; ty1 = ty0 + (y1 - y0)
+                    tx0 = x0 - xa; tx1 = tx0 + (x1 - x0)
                     J = Jp[:, :, tz0:tz1, ty0:ty1, tx0:tx1]
 
                     # Convert to numpy and drop the leading batch dim
@@ -477,7 +439,10 @@ class ChunkDataset(Dataset):
 # solve the eigenvalue problem and sanitize the output
 def _eigh_and_sanitize(M: torch.Tensor):
     # 1) enforce symmetry (numerically more stable? M is already symmetrical)
-    # M = 0.5 * (M + M.transpose(-1, -2))
+    M = 0.5 * (M + M.transpose(-1, -2))
+
+    # --- sanitize INPUT before eigh to avoid NaN/Inf failures ---
+    M = torch.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0)
 
     w, v = torch.linalg.eigh(M) 
     # sanitize once
@@ -535,7 +500,13 @@ def _compute_eigenvectors(
     return eigvals, eigvecs
 
 def _finalize_structure_tensor_torch(
-    zarr_path, chunk_size, num_workers, compressor, verbose, swap_eigenvectors=False
+    zarr_path,
+    chunk_size,
+    num_workers,
+    compressor,
+    verbose,
+    swap_eigenvectors: bool = False,
+    device: Optional[Union[str, torch.device]] = None,
 ):
     """
     Compute eigenvectors and eigenvalues from structure tensor and save as groups.
@@ -547,6 +518,7 @@ def _finalize_structure_tensor_torch(
         compressor: Zarr compressor to use
         verbose: Enable verbose output
         swap_eigenvectors: Whether to swap eigenvectors 0 and 1
+        device: torch device to use ('cpu', 'cuda:0', etc.)
     """
     # Open the root group
     root_store = zarr.open_group(
@@ -581,9 +553,6 @@ def _finalize_structure_tensor_torch(
         overwrite=True
     )
 
-    eigenvectors_arr.attrs['layout'] = 'eigenvectors[vector, component, z, y, x]'
-    eigenvectors_arr.attrs['description'] = 'Right-handed orthonormal basis sorted by eigenvalue magnitude'
-    eigenvectors_arr.attrs['swapped_0_1'] = bool(swap_eigenvectors)
     # prepare eigenvalues group
     eigenvalues_arr = root_store.create_dataset(
         'eigenvalues',
@@ -594,9 +563,7 @@ def _finalize_structure_tensor_torch(
         write_empty_chunks=False,
         overwrite=True
     )
-    eigenvalues_arr.attrs['layout'] = 'eigenvalues[index, z, y, x]'
-    eigenvalues_arr.attrs['description'] = 'Eigenvalues sorted ascending (λ0 ≤ λ1 ≤ λ2)'
-
+    
     # build chunk list
     def gen_bounds():
         for z0 in range(0, Z, cz):
@@ -610,7 +577,11 @@ def _finalize_structure_tensor_torch(
         print(f"[Eigen] {len(chunks)} chunks to solve the eigenvalue problem on")
 
     # Dataset & DataLoader
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Resolve device (backward compatible default)
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        device = torch.device(device)
     
     # Modified ChunkDataset to work with zarr groups
     class GroupChunkDataset(Dataset):
@@ -632,7 +603,7 @@ def _finalize_structure_tensor_torch(
     loader = DataLoader(
         ds,
         batch_size=1,
-        num_workers=0,
+        num_workers=num_workers,
         pin_memory=False,
         collate_fn=lambda batch: batch[0]
     )
@@ -673,10 +644,13 @@ def _finalize_structure_tensor_torch(
         # back to original layout
         v_corrected = V_flat.permute(1,2,0).reshape(3,3,*eigvecs_block.shape[1:])
 
-        # orient eigenvectors such that, on average, the first eigenvector is upwards wrt global coordinates [+1,0,0]
-        upwards = v_corrected[0, :, ...].mean(dim=(1,2,3))
-        if upwards[0] < 0:
-            v_corrected *= -1
+        # Orient eigenvectors: keep right-handedness but align first vector toward +X on average.
+        # Compute sign from the first component of v0 averaged over the block
+        s = torch.sign(v_corrected[0, 0, ...].mean())
+        s = torch.tensor(1.0, device=v_corrected.device) if s == 0 else s
+        # Flip v0 and v2 together to preserve determinant > 0
+        v_corrected[0, ...] *= s
+        v_corrected[2, ...] *= s
 
         eigvecs_block = v_corrected.reshape(9, *eigvecs_block.shape[1:]).cpu().numpy()
 
@@ -693,9 +667,9 @@ def main():
     parser = argparse.ArgumentParser(description='Compute 3D structure tensor or eigenvalues/eigenvectors')
     
     # Basic I/O arguments
-    parser.add_argument('--input_dir', type=str, required=True, 
+    parser.add_argument('--input_dir', type=str, required=False, 
                         help='Path to the input Zarr volume')
-    parser.add_argument('--output_dir', type=str, required=True, 
+    parser.add_argument('--output_dir', type=str, required=False, 
                         help='Path to store output results')
     
     # Mode selection
@@ -761,6 +735,12 @@ def main():
     if args.structure_tensor:
         args.mode = 'structure-tensor'
     
+    # Validate required args conditionally by mode
+    if args.mode == 'structure-tensor':
+        if not args.input_dir or not args.output_dir:
+            print("Error: --input_dir and --output_dir are required for structure-tensor mode")
+            return 2
+        
     # Parse patch size if provided
     patch_size = None
     if args.patch_size:
@@ -781,15 +761,15 @@ def main():
     
     # Get compressor
     if args.zarr_compressor.lower() == 'zstd':
-        compressor = zarr.Blosc(cname='zstd', clevel=args.zarr_compression_level, shuffle=zarr.Blosc.SHUFFLE)
+        compressor = Blosc(cname='zstd', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
     elif args.zarr_compressor.lower() == 'lz4':
-        compressor = zarr.Blosc(cname='lz4', clevel=args.zarr_compression_level, shuffle=zarr.Blosc.SHUFFLE)
+        compressor = Blosc(cname='lz4', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
     elif args.zarr_compressor.lower() == 'zlib':
-        compressor = zarr.Blosc(cname='zlib', clevel=args.zarr_compression_level, shuffle=zarr.Blosc.SHUFFLE)
+        compressor = Blosc(cname='zlib', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
     elif args.zarr_compressor.lower() == 'none':
         compressor = None
     else:
-        compressor = zarr.Blosc(cname='zstd', clevel=1, shuffle=zarr.Blosc.SHUFFLE)
+        compressor = Blosc(cname='zstd', clevel=1, shuffle=Blosc.SHUFFLE)
     
     if args.mode == 'structure-tensor':
         # Run structure tensor computation
@@ -843,7 +823,8 @@ def main():
                         num_workers=args.num_workers,
                         compressor=compressor,
                         verbose=args.verbose,
-                        swap_eigenvectors=args.swap_eigenvectors
+                        swap_eigenvectors=args.swap_eigenvectors,
+                        device=args.device
                     )
                     print("\n--- All computations completed successfully ---")
                     print(f"Final output contains:")
@@ -876,7 +857,8 @@ def main():
                 num_workers=args.num_workers,
                 compressor=compressor,
                 verbose=args.verbose,
-                swap_eigenvectors=args.swap_eigenvectors
+                swap_eigenvectors=args.swap_eigenvectors,
+                device=args.device
             )
             
             print("\n--- Eigenanalysis Completed Successfully ---")

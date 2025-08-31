@@ -1,5 +1,4 @@
-# vector_fields.py
-
+# create_vf.py
 import torch
 import zarr
 import numpy as np
@@ -7,8 +6,16 @@ from data.utils import open_zarr
 from typing import Dict, Tuple, Optional
 from tqdm.auto import tqdm
 
-from smooth_vf import VectorFieldModule
-from vf_io import load_density_mask, load_eigenvector_field
+try:
+    # Module execution (recommended)
+    from .smooth_vf import VectorFieldModule
+    from .vf_io import load_density_mask, load_eigenvector_field
+    from .vf_format import OMEU8VectorWriter
+except ImportError:
+    # Script execution fallback
+    from smooth_vf import VectorFieldModule
+    from vf_io import load_density_mask, load_eigenvector_field
+    from vf_format import OMEU8VectorWriter
 
 class VectorFieldComputer:
     def __init__(
@@ -31,20 +38,42 @@ class VectorFieldComputer:
         output_zarr: str,
         chunk_size: Tuple[int,int,int],
         compressor=None,
+        *,
+        ome_u8: bool = True,
+        group_name: str = "horizontal",   # semantic name per Paul's spec
+        output_downsample: int = 1,
+        output_ome_scale: str = "0",
+        write_confidence: bool = True,
+        ome_only: bool = False,
+        export_field: str = "V",          # which vector to export to OME-u8: "U" | "V" |
     ):
         # open input to get shape
         inp = open_zarr(self.input_zarr, mode='r')
         Z, Y, X = inp.shape[-3:]
         cz, cy, cx = chunk_size
 
-        # open/create output
+        # prepare outputs
         root = zarr.open_group(output_zarr, mode='a')
-        U_ds = root.require_dataset('U',   shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
-                                    dtype=np.float32, compressor=compressor, overwrite=True)
-        V_ds = root.require_dataset('V',   shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
-                                    dtype=np.float32, compressor=compressor, overwrite=True)
-        N_ds = root.require_dataset('N',   shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
-                                    dtype=np.float32, compressor=compressor, overwrite=True)
+        if not ome_only:
+            U_ds = root.require_dataset('U', shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
+                                        dtype=np.float32, compressor=compressor, overwrite=True)
+            V_ds = root.require_dataset('V', shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
+                                        dtype=np.float32, compressor=compressor, overwrite=True)
+            N_ds = root.require_dataset('N', shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
+                                        dtype=np.float32, compressor=compressor, overwrite=True)
+        # OME-ish uint8 writer (writes component groups z/y/x at scale)
+        writer = None
+        if ome_u8:
+            writer = OMEU8VectorWriter(
+                output_path=output_zarr,
+                group_name=group_name,
+                vol_shape_zyx=(Z, Y, X),
+                chunks_zyx=(cz, cy, cx),
+                compressor=compressor,
+                scale_name=output_ome_scale,
+                downsample=output_downsample,
+                make_confidence=write_confidence,
+            )
         # generate chunk bounds
         def gen_bounds():
             for z0 in range(0, Z, cz):
@@ -98,10 +127,40 @@ class VectorFieldComputer:
                 V_block += V_ext[:, iz0:iz0+Dz, iy0:iy0+Dy, ix0:ix0+Dx]
                 N_block += N_ext[:, iz0:iz0+Dz, iy0:iy0+Dy, ix0:ix0+Dx]
 
-            # 5) write out
-            U_ds[:, z0:z1, y0:y1, x0:x1] = U_block.cpu().numpy()
-            V_ds[:, z0:z1, y0:y1, x0:x1] = V_block.cpu().numpy()
-            N_ds[:, z0:z1, y0:y1, x0:x1] = N_block.cpu().numpy()
+            # 5) write out floats (unless ome-only)
+            if not ome_only:
+                U_ds[:, z0:z1, y0:y1, x0:x1] = U_block.cpu().numpy()
+                V_ds[:, z0:z1, y0:y1, x0:x1] = V_block.cpu().numpy()
+                N_ds[:, z0:z1, y0:y1, x0:x1] = N_block.cpu().numpy()
+
+            # 6) write OME-ish uint8 for chosen vector (defaults to "horizontal" = V)
+            if writer is not None:
+                if export_field.upper() == "U":
+                    H = U_block
+                elif export_field.upper() == "N":
+                    H = N_block
+                else:
+                    H = V_block
+                # normalize to unit vectors; confidence = ||H|| clamped to [0,1]
+                # (components are ordered z,y,x in channel dim)
+                norm = torch.linalg.vector_norm(H, dim=0)  # [Dz,Dy,Dx]
+                eps = 1e-8
+                Hn = H / (norm + eps)
+                # (3,Dz,Dy,Dx) -> (Dz,Dy,Dx,3)
+                directions = torch.movedim(Hn, 0, -1).cpu().numpy()
+                conf = None
+                if write_confidence:
+                    conf = torch.clamp(norm, 0.0, 1.0).cpu().numpy()
+                writer.write_block(
+                    z0=z0, z1=z1, y0=y0, y1=y1, x0=x0, x1=x1,
+                    directions_block_zyx=directions,
+                    confidence_block=conf,
+                )
             torch.cuda.empty_cache()
 
-        print(f"✔ chunked U, V, N written to {output_zarr}")
+        if writer is not None:
+            writer.close()
+        if not ome_only:
+            print(f"✔ chunked U, V, N written to {output_zarr}")
+        if writer is not None:
+            print(f"✔ OME-ish uint8 written under '{group_name}/{{z,y,x}}/{output_ome_scale}' in {output_zarr}")

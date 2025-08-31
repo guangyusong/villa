@@ -444,9 +444,6 @@ def _eigh_and_sanitize(M: torch.Tensor):
     # --- sanitize INPUT before eigh to avoid NaN/Inf failures ---
     M = torch.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # --- sanitize INPUT before eigh to avoid NaN/Inf failures ---
-    M = torch.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0)
-
     w, v = torch.linalg.eigh(M) 
     # sanitize once
     w = torch.nan_to_num(w.float(), nan=0.0, posinf=0.0, neginf=0.0)

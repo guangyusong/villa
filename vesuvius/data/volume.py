@@ -12,9 +12,6 @@ from io import BytesIO
 from pathlib import Path
 # Direct import to avoid circular reference issues
 # Import necessary functions directly to avoid circular imports
-import os
-import yaml
-import requests
 from setup.accept_terms import get_installation_path
 import zarr
 

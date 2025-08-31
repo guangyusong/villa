@@ -206,52 +206,27 @@ def run_structure_tensor_part(args, part_id, gpu_id, shared_output_path):
 
 
 def run_eigenanalysis(zarr_path, chunk_size, compressor, verbose, swap_eigenvectors, num_workers):
-    """Run eigenanalysis on a structure tensor zarr to compute eigenvectors."""
+    """Run eigenanalysis directly (no subprocess) to avoid duplicate prints."""
+    from structure_tensor.create_st import _finalize_structure_tensor_torch
     print("\n--- Running Eigenanalysis ---")
-    
-    # Build command to run create_st.py's eigenanalysis mode
-    cmd = [sys.executable, '-m', 'structure_tensor.create_st']
-    
-    # Basic arguments
-    cmd.extend(['--mode', 'eigenanalysis'])
-    cmd.extend(['--eigen-input', zarr_path])
-    
-    # Optional arguments
-    if chunk_size:
-        cmd.extend(['--chunk-size', chunk_size])
-    
-    if swap_eigenvectors:
-        cmd.append('--swap-eigenvectors')
-    
-    # Compression settings
-    if compressor is None:
-        cmd.extend(['--zarr-compressor', 'none'])
-    else:
-        cmd.extend(['--zarr-compressor', compressor.cname])
-        if hasattr(compressor, 'clevel'):
-            cmd.extend(['--zarr-compression-level', str(compressor.clevel)])
-    
-    cmd.extend(['--num-workers', str(num_workers)])
-    
-    if verbose:
-        cmd.append('--verbose')
-    
-    print(f"Running eigenanalysis: {' '.join(cmd)}")
-    
-    # Run with live stdout/stderr streaming
-    proc = subprocess.Popen(
-        cmd,
-        stdout=None,
-        stderr=None,
-        universal_newlines=True,
-        bufsize=1
+    # normalize chunk_size to a tuple
+    if isinstance(chunk_size, str) and chunk_size:
+        chunk_size = tuple(map(int, chunk_size.split(',')))
+    # call directly
+    _finalize_structure_tensor_torch(
+        zarr_path=zarr_path,
+        chunk_size=chunk_size,
+        num_workers=num_workers,
+        compressor=compressor,
+        verbose=verbose,
+        swap_eigenvectors=swap_eigenvectors,
+        device=None,  # let the helper pick cuda/cpu
+        ome_out=not getattr(run_eigenanalysis, "_no_ome_out", False),
+        ome_downsample=getattr(run_eigenanalysis, "_ome_downsample", 1),
+        ome_scale=getattr(run_eigenanalysis, "_ome_scale", "0"),
+        confidence_metric=getattr(run_eigenanalysis, "_confidence_metric", "fa"),
+        keep_eigen=getattr(run_eigenanalysis, "_keep_eigen", False),
     )
-    
-    rc = proc.wait()
-    if rc != 0:
-        print(f"Eigenanalysis FAILED with return code {rc}")
-        return False
-    
     print("Eigenanalysis completed successfully")
     return True
 
@@ -322,6 +297,19 @@ def parse_arguments():
     parser.add_argument('--delete-intermediate', action='store_true',
                         help='Delete intermediate structure tensor after eigenanalysis')
     
+    # OME-style output & confidence options for eigenanalysis
+    parser.add_argument('--no-ome-out', action='store_true',
+                        help='Disable OME-style outputs (first/second/normal + confidence).')
+    parser.add_argument('--ome-downsample', type=int, default=1,
+                        help='Downsample factor (pick-every-N) for OME outputs (default: 1).')
+    parser.add_argument('--ome-scale', type=str, default='0',
+                        help='Scale name (group key) to write under, e.g. "0" (default).')
+    parser.add_argument('--confidence-metric', type=str, default='fa',
+                        choices=['fa', 'linearity', 'planarity', 'max_lp'],
+                        help='Confidence scalar to export (default: fa).')
+    parser.add_argument('--keep-eigen', action='store_true',
+                        help='Also write float32 eigenvectors/eigenvalues arrays.')
+    
     # Multi-GPU arguments
     parser.add_argument('--gpus', type=str, default='all',
                         help='GPU IDs to use, comma-separated (e.g., "0,1,2") or "all" for all available GPUs')
@@ -375,6 +363,12 @@ def main():
     
     # Handle eigenanalysis-only mode
     if args.mode == 'eigenanalysis':
+        # stash options on the function so run_eigenanalysis can pass them through
+        run_eigenanalysis._no_ome_out = args.no_ome_out
+        run_eigenanalysis._ome_downsample = args.ome_downsample
+        run_eigenanalysis._ome_scale = args.ome_scale
+        run_eigenanalysis._confidence_metric = args.confidence_metric
+        run_eigenanalysis._keep_eigen = args.keep_eigen
         success = run_eigenanalysis(
             zarr_path=args.eigen_input,
             chunk_size=chunk_size_str,
@@ -387,8 +381,11 @@ def main():
         if success:
             print("\n--- Eigenanalysis Completed Successfully ---")
             print(f"Results saved to:")
-            print(f"  - Eigenvectors: {args.eigen_input}/eigenvectors")
-            print(f"  - Eigenvalues: {args.eigen_input}/eigenvalues")
+            if not args.no_ome_out:
+                print(f"  - first_component/, second_component/, normal/, confidence/ (scale '{args.ome_scale}', ds={args.ome_downsample})")
+            if args.keep_eigen:
+                print(f"  - Eigenvectors: {args.eigen_input}/eigenvectors")
+                print(f"  - Eigenvalues: {args.eigen_input}/eigenvalues")
             return 0
         else:
             print("\n--- Eigenanalysis Failed ---")
@@ -427,7 +424,8 @@ def main():
         if args.patch_size:
             try:
                 patch_size = tuple(map(int, args.patch_size.split(',')))
-                print(f"Using user-specified patch size: {patch_size}")
+                if args.verbose:
+                    print(f"Using user-specified patch size: {patch_size}")
             except Exception as e:
                 print(f"Error parsing patch_size: {e}")
                 print("Using default patch size.")
@@ -513,6 +511,12 @@ def main():
         if not zarr_path:
             print("Error: No structure tensor output path available for eigenanalysis.")
             return 1
+        # stash options on the function so run_eigenanalysis can pass them through
+        run_eigenanalysis._no_ome_out = args.no_ome_out
+        run_eigenanalysis._ome_downsample = args.ome_downsample
+        run_eigenanalysis._ome_scale = args.ome_scale
+        run_eigenanalysis._confidence_metric = args.confidence_metric
+        run_eigenanalysis._keep_eigen = args.keep_eigen
         ok = run_eigenanalysis(
             zarr_path=zarr_path,
             chunk_size=chunk_size_str,
@@ -527,8 +531,11 @@ def main():
             delete_intermediate_file(zarr_path, verbose=args.verbose)
         print("\n--- All computations completed successfully ---")
         print(f"  - Structure tensor: {zarr_path}/structure_tensor")
-        print(f"  - Eigenvectors: {zarr_path}/eigenvectors")
-        print(f"  - Eigenvalues:  {zarr_path}/eigenvalues")
+        if not args.no_ome_out:
+            print(f"  - first_component/, second_component/, normal/, confidence/ (scale '{args.ome_scale}', ds={args.ome_downsample})")
+        if args.keep_eigen:
+            print(f"  - Eigenvectors: {zarr_path}/eigenvectors")
+            print(f"  - Eigenvalues:  {zarr_path}/eigenvalues")
     return 0
 
 

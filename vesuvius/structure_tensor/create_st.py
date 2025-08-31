@@ -1,15 +1,9 @@
 #create_st.py
 import argparse
-import shutil
 import torch
 from torch import nn
 import torch.nn.functional as F
-import fsspec
 import numpy as np
-import os
-import subprocess
-import time
-import traceback
 from pathlib import Path
 from typing import Optional, Union
 from tqdm.auto import tqdm
@@ -20,6 +14,27 @@ import numcodecs
 from models.run.inference import Inferer
 from data.utils import open_zarr
 from numcodecs import Blosc
+
+def _ceildiv(a: int, b: int) -> int:
+    """Ceiling division for positives."""
+    return -(-a // b)
+
+def _quantize_dir_u8(v: np.ndarray) -> np.ndarray:
+    """Quantize directional component in [-1,1] to uint8 [0,255]."""
+    v = np.clip(v, -1.0, 1.0)
+    return np.rint((v * 0.5 + 0.5) * 255.0).astype(np.uint8)
+
+def _quantize_unit_u8(a: np.ndarray) -> np.ndarray:
+    """Quantize scalar in [0,1] to uint8 [0,255]."""
+    a = np.clip(a, 0.0, 1.0)
+    return np.rint(a * 255.0).astype(np.uint8)
+
+def _dtype_unit_scale(np_dtype) -> float:
+    """Return a sensible scale for dtype: integer→max, float/bool→1.0."""
+    import numpy as _np
+    if _np.issubdtype(np_dtype, _np.integer):
+        return float(_np.iinfo(np_dtype).max)   # e.g., 255, 65535
+    return 1.0  # float/bool: treat as already normalized
 
 class StructureTensorInferer(Inferer, nn.Module):
     """
@@ -37,8 +52,17 @@ class StructureTensorInferer(Inferer, nn.Module):
         nn.Module.__init__(self)
         
         self.step_size = step_size
-        # --- Remove any incoming normalization_scheme so it can't collide ---
-        kwargs.pop('normalization_scheme', None)
+        # --- Remove any incoming args the base Inferer doesn't know about ---
+        # (guards against CLI flags/wrapper options like OME export)
+        for _k in (
+            'normalization_scheme',
+            'ome_out',           # from wrappers
+            'keep_eigen',        # if present
+            'confidence_metric', # if present
+            'ome_downsample',    # if present
+            'ome_scale'          # if present
+        ):
+            kwargs.pop(_k, None)
 
         # --- Now initialize Inferer, forcing normalization_scheme='none' ---
         Inferer.__init__(self, *args, normalization_scheme='none', **kwargs)
@@ -367,12 +391,17 @@ class StructureTensorInferer(Inferer, nn.Module):
 
                     # --- robust channel handling: ensure [1,1,Z,Y,X] for conv3d ---
                     if input_src.ndim == 3:
-                        raw = input_src[za:zb, ya:yb, xa:xb].astype('float32')              # [Z,Y,X]
+                        raw = input_src[za:zb, ya:yb, xa:xb].astype('float32')
                     else:
-                        # pick first channel (or replace with mean over channels if desired)
-                        raw = input_src[0, za:zb, ya:yb, xa:xb].astype('float32')           # [Z,Y,X]
-                    x = torch.from_numpy(raw).to(self.device).unsqueeze(0).unsqueeze(0)     # [1,1,Z,Y,X]
-                    # ---
+                        raw = input_src[0, za:zb, ya:yb, xa:xb].astype('float32')
+
+                    x = torch.from_numpy(raw).to(self.device).unsqueeze(0).unsqueeze(0)  # [1,1,Z,Y,X]
+
+                    # Normalize to [0,1] by dtype max when NOT using a fiber mask
+                    if self.volume is None:
+                        scale = _dtype_unit_scale(input_src.dtype)
+                        # guard against weird dtypes; no-op for floats/bools (scale=1)
+                        x = x.float() / max(scale, 1e-8)
 
                     # Apply fiber-volume mask if needed
                     if self.volume is not None:
@@ -507,10 +536,22 @@ def _finalize_structure_tensor_torch(
     verbose,
     swap_eigenvectors: bool = False,
     device: Optional[Union[str, torch.device]] = None,
+    *,
+    # NEW OME-style output options
+    ome_out: bool = True,
+    ome_downsample: int = 1,
+    ome_scale: str = "0",
+    confidence_metric: str = "fa",
+    keep_eigen: bool = False,
 ):
     """
-    Compute eigenvectors and eigenvalues from structure tensor and save as groups.
-    
+    Compute eigenvectors/eigenvalues from structure tensor. By default, write
+    OME-style outputs:
+      - first_component/{z,y,x}/<scale>  (uint8 in [-1,1] → [0,255])
+      - second_component/{z,y,x}/<scale>
+      - normal/{z,y,x}/<scale>
+      - confidence/<scale>               (uint8; FA in [0,1] → [0,255])
+    Optionally keep raw eigenvectors/eigenvalues when keep_eigen=True.
     Args:
         zarr_path: Path to the zarr file containing structure_tensor group
         chunk_size: Chunk size for processing
@@ -541,28 +582,60 @@ def _finalize_structure_tensor_torch(
     if verbose:
         print(f"[Eigen] using chunks (dz,dy,dx)=({cz},{cy},{cx})")
 
-    # prepare eigenvectors group
-    out_chunks = (1, cz, cy, cx)
-    eigenvectors_arr = root_store.create_dataset(
-        'eigenvectors',
-        shape=(9, Z, Y, X),
-        chunks=out_chunks,
-        compressor=compressor,
-        dtype=np.float32,
-        write_empty_chunks=False,
-        overwrite=True
-    )
+    # ---- OME-style outputs (downsampled, uint8) ----
+    ds_factor = max(1, int(ome_downsample))
+    Zds, Yds, Xds = _ceildiv(Z, ds_factor), _ceildiv(Y, ds_factor), _ceildiv(X, ds_factor)
+    out_chunks_ds = (max(1, cz // ds_factor), max(1, cy // ds_factor), max(1, cx // ds_factor))
 
-    # prepare eigenvalues group
-    eigenvalues_arr = root_store.create_dataset(
-        'eigenvalues',
-        shape=(3, Z, Y, X),
-        chunks=out_chunks,
-        compressor=compressor,
-        dtype=np.float32,
-        write_empty_chunks=False,
-        overwrite=True
-    )
+    def _ensure_vec_target(root, name: str):
+        g = root.require_group(name)
+        gz = g.require_group("z")
+        gy = g.require_group("y")
+        gx = g.require_group("x")
+        # (Re)create datasets per axis at this scale
+        for axg in (gz, gy, gx):
+            if ome_scale in axg:
+                del axg[ome_scale]
+            axg.create_dataset(
+                ome_scale, shape=(Zds, Yds, Xds), chunks=out_chunks_ds,
+                dtype=np.uint8, compressor=compressor, write_empty_chunks=False
+            )
+        return gz[ome_scale], gy[ome_scale], gx[ome_scale]
+
+    if ome_out:
+        fz, fy, fx = _ensure_vec_target(root_store, "first_component")
+        sz_, sy_, sx_ = _ensure_vec_target(root_store, "second_component")
+        nz, ny, nx = _ensure_vec_target(root_store, "normal")
+        # confidence dataset
+        conf_group = root_store.require_group("confidence")
+        if ome_scale in conf_group:
+            del conf_group[ome_scale]
+        conf_ds = conf_group.create_dataset(
+            ome_scale, shape=(Zds, Yds, Xds), chunks=out_chunks_ds,
+            dtype=np.uint8, compressor=compressor, write_empty_chunks=False
+        )
+
+    # ---- Optional: keep full-precision eigen* arrays (float32) ----
+    if keep_eigen:
+        out_chunks = (1, cz, cy, cx)
+        eigenvectors_arr = root_store.create_dataset(
+            'eigenvectors',
+            shape=(9, Z, Y, X),
+            chunks=out_chunks,
+            compressor=compressor,
+            dtype=np.float32,
+            write_empty_chunks=False,
+            overwrite=True
+        )
+        eigenvalues_arr = root_store.create_dataset(
+            'eigenvalues',
+            shape=(3, Z, Y, X),
+            chunks=out_chunks,
+            compressor=compressor,
+            dtype=np.float32,
+            write_empty_chunks=False,
+            overwrite=True
+        )
     
     # build chunk list
     def gen_bounds():
@@ -599,9 +672,9 @@ def _finalize_structure_tensor_torch(
             block = torch.from_numpy(block_np).to(self.device)
             return idx, (z0, z1, y0, y1, x0, x1), block
     
-    ds = GroupChunkDataset(src, chunks, device)
+    gds = GroupChunkDataset(src, chunks, device)
     loader = DataLoader(
-        ds,
+        gds,
         batch_size=1,
         num_workers=num_workers,
         pin_memory=False,
@@ -652,13 +725,63 @@ def _finalize_structure_tensor_torch(
         v_corrected[0, ...] *= s
         v_corrected[2, ...] *= s
 
-        eigvecs_block = v_corrected.reshape(9, *eigvecs_block.shape[1:]).cpu().numpy()
+        # numpy views
+        v_np = v_corrected.cpu().numpy()     # [3,3,dz,dy,dx]
+        w_np = eigvals_block                 # [3,dz,dy,dx]
 
-        # write to groups
-        eigenvectors_arr[:, z0:z1, y0:y1, x0:x1] = eigvecs_block
-        eigenvalues_arr[:, z0:z1, y0:y1, x0:x1] = eigvals_block
+        # ---------- Write OME-style outputs (downsampled + quantized) ----------
+        if ome_out:
+            # Compute aligned downsample slices per axis
+            def _axis_ds(a0, a1, s):
+                start = (s - (a0 % s)) % s
+                sl = slice(start, a1 - a0, s)
+                o0 = (a0 + start) // s
+                o1 = (a1 - 1) // s + 1
+                return sl, o0, o1
+            slz, oz0, oz1 = _axis_ds(z0, z1, ds_factor)
+            sly, oy0, oy1 = _axis_ds(y0, y1, ds_factor)
+            slx, ox0, ox1 = _axis_ds(x0, x1, ds_factor)
 
-    if verbose:
+            # FIRST (vector 0)
+            fz[oz0:oz1, oy0:oy1, ox0:ox1] = _quantize_dir_u8(v_np[0, 0, slz, sly, slx])
+            fy[oz0:oz1, oy0:oy1, ox0:ox1] = _quantize_dir_u8(v_np[0, 1, slz, sly, slx])
+            fx[oz0:oz1, oy0:oy1, ox0:ox1] = _quantize_dir_u8(v_np[0, 2, slz, sly, slx])
+            # SECOND (vector 1)
+            sz_[oz0:oz1, oy0:oy1, ox0:ox1] = _quantize_dir_u8(v_np[1, 0, slz, sly, slx])
+            sy_[oz0:oz1, oy0:oy1, ox0:ox1] = _quantize_dir_u8(v_np[1, 1, slz, sly, slx])
+            sx_[oz0:oz1, oy0:oy1, ox0:ox1] = _quantize_dir_u8(v_np[1, 2, slz, sly, slx])
+            # NORMAL (vector 2)
+            nz[oz0:oz1, oy0:oy1, ox0:ox1] = _quantize_dir_u8(v_np[2, 0, slz, sly, slx])
+            ny[oz0:oz1, oy0:oy1, ox0:ox1] = _quantize_dir_u8(v_np[2, 1, slz, sly, slx])
+            nx[oz0:oz1, oy0:oy1, ox0:ox1] = _quantize_dir_u8(v_np[2, 2, slz, sly, slx])
+
+            # Confidence (default: Fractional Anisotropy)
+            l1, l2, l3 = w_np[0], w_np[1], w_np[2]
+            eps = 1e-12
+            if confidence_metric == "linearity":
+                conf = (l3 - l2) / (np.abs(l3) + eps)
+            elif confidence_metric == "planarity":
+                conf = (l2 - l1) / (np.abs(l3) + eps)
+            elif confidence_metric == "max_lp":
+                cl = (l3 - l2) / (np.abs(l3) + eps)
+                cp = (l2 - l1) / (np.abs(l3) + eps)
+                conf = np.maximum(cl, cp)
+            else:  # "fa"
+                lbar = (l1 + l2 + l3) / 3.0
+                num = (l1 - lbar) ** 2 + (l2 - lbar) ** 2 + (l3 - lbar) ** 2
+                den = (l1 ** 2 + l2 ** 2 + l3 ** 2) + eps
+                conf = np.sqrt(1.5) * np.sqrt(num) / np.sqrt(den)
+            conf_ds[oz0:oz1, oy0:oy1, ox0:ox1] = _quantize_unit_u8(conf[slz, sly, slx])
+
+        # ---------- Optional: keep raw eigen* ----------
+        if keep_eigen:
+            eigvecs_block_full = v_np.reshape(9, *v_np.shape[2:])
+            eigenvectors_arr[:, z0:z1, y0:y1, x0:x1] = eigvecs_block_full
+            eigenvalues_arr[:,  z0:z1, y0:y1, x0:x1] = w_np
+
+    if verbose and ome_out:
+        print(f"[OME] wrote first_component/ second_component/ normal/ and confidence/ at scale='{ome_scale}', downsample={ds_factor}")
+    if verbose and keep_eigen:
         print(f"[Eigen] eigenvectors → {zarr_path}/eigenvectors")
         print(f"[Eigen] eigenvalues  → {zarr_path}/eigenvalues")
 
@@ -715,6 +838,18 @@ def main():
     parser.add_argument('--delete-intermediate', action='store_true',
                         help='Delete intermediate structure tensor after eigenanalysis')
     
+    # OME-style output options
+    parser.add_argument('--ome-out', action='store_true', default=True,
+                        help='Write OME-style outputs (first/second/normal + confidence).')
+    parser.add_argument('--ome-downsample', type=int, default=1,
+                        help='Pick-every-N downsample when writing OME outputs.')
+    parser.add_argument('--ome-scale', type=str, default='0',
+                        help='Name of the scale node to write under (e.g., "0").')
+    parser.add_argument('--confidence-metric', type=str, default='fa',
+                        choices=['fa','linearity','planarity','max_lp'],
+                        help='Scalar confidence metric to export.')
+    parser.add_argument('--keep-eigen', action='store_true', default=False,
+                        help='Also keep raw eigenvectors/eigenvalues arrays.')
     
     # Other arguments
     parser.add_argument('--device', type=str, default='cuda', 
@@ -794,6 +929,11 @@ def main():
             batch_size=args.batch_size,
             patch_size=patch_size,
             device=args.device,
+            ome_out=args.ome_out,
+            ome_downsample=args.ome_downsample,
+            ome_scale=args.ome_scale,
+            confidence_metric=args.confidence_metric,
+            keep_eigen=args.keep_eigen,
             verbose=args.verbose,
             compressor_name=args.zarr_compressor,
             compression_level=args.zarr_compression_level,
@@ -829,11 +969,11 @@ def main():
                     print("\n--- All computations completed successfully ---")
                     print(f"Final output contains:")
                     print(f"  - Structure tensor: {logits_path}/structure_tensor")
-                    print(f"  - Eigenvectors: {logits_path}/eigenvectors")
-                    print(f"  - Eigenvalues: {logits_path}/eigenvalues")
-                else:
-                    print("\n--- Structure tensor only mode ---")
-                    print("Eigenanalysis was skipped (--structure-tensor-only flag)")
+                    if args.ome_out:
+                        print(f"  - first_component/, second_component/, normal/, confidence/ (scale '{args.ome_scale}', ds={args.ome_downsample})")
+                    if args.keep_eigen:
+                        print(f"  - Eigenvectors: {logits_path}/eigenvectors")
+                        print(f"  - Eigenvalues: {logits_path}/eigenvalues")
                 
         except Exception as e:
             print(f"\n--- Structure Tensor Computation Failed ---")
@@ -858,13 +998,21 @@ def main():
                 compressor=compressor,
                 verbose=args.verbose,
                 swap_eigenvectors=args.swap_eigenvectors,
-                device=args.device
+                device=args.device,
+                ome_out=args.ome_out,
+                ome_downsample=args.ome_downsample,
+                ome_scale=args.ome_scale,
+                confidence_metric=args.confidence_metric,
+                keep_eigen=args.keep_eigen,
             )
             
             print("\n--- Eigenanalysis Completed Successfully ---")
             print(f"Results saved to:")
-            print(f"  - Eigenvectors: {args.eigen_input}/eigenvectors")
-            print(f"  - Eigenvalues: {args.eigen_input}/eigenvalues")
+            if args.ome_out:
+                print(f"  - first_component/, second_component/, normal/, confidence/ (scale '{args.ome_scale}', ds={args.ome_downsample})")
+            if args.keep_eigen:
+                print(f"  - Eigenvectors: {args.eigen_input}/eigenvectors")
+                print(f"  - Eigenvalues: {args.eigen_input}/eigenvalues")
             
         except Exception as e:
             print(f"\n--- Eigenanalysis Failed ---")

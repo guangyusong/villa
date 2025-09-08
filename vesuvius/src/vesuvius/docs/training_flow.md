@@ -14,6 +14,7 @@ Note that significant portions of this pipeline were borrowed/inspired by [dynam
 7. [Key Features](#key-features-and-design-patterns)
 8. [Error Handling](#error-handling-and-validation)
 9. [Output and Results](#output-and-results)
+10. [Auxiliary Tasks](#auxiliary-tasks)
 
 ## High-Level Training Flow
 
@@ -252,6 +253,68 @@ data_path/
 3. **Learning Rate Scheduler**:
    - CosineAnnealingLR by default
    - Adjusts learning rate over epochs
+
+## 6. Auxiliary Tasks
+
+Auxiliary tasks let you add side objectives that are derived from a primary “source” target (e.g., distance transform or surface normals of a binary mask). They use the shared encoder with separate decoders and integrate into the same multi-task loss.
+
+- Configuration: Add an `auxiliary_tasks` block to your YAML. Each entry must specify:
+  - `type`: One of `distance_transform`, `surface_normals`.
+  - `source_target`: The primary target name to derive from (e.g., `ink`, `surface`).
+  - `losses`: List of losses and weights for the auxiliary head.
+  - `loss_weight`: Optional overall weight for the task.
+  - `out_channels`: Optional for `distance_transform` (defaults to 1); for `surface_normals` it is set automatically based on dimensionality (2 for 2D, 3 for 3D).
+
+Example (excerpt):
+
+```yaml
+dataset_config:
+  targets:
+    surface:
+      losses:
+        - name: "BCEWithLogitsLoss"
+          weight: 1.0
+
+auxiliary_tasks:
+  distance_transform:
+    type: distance_transform
+    source_target: surface
+    loss_weight: 0.10
+    losses:
+      - name: "SignedDistanceLoss"
+        weight: 1.0
+        kwargs:
+          rho: 6
+          beta: 1
+          eikonal: true
+
+  surface_normals:
+    type: surface_normals
+    source_target: surface
+    loss_weight: 0.10
+    losses:
+      - name: "CosineSimilarityLoss"
+        weight: 1.0
+        kwargs: { dim: 1 }
+      - name: "NormalSmoothnessLoss"
+        weight: 0.5
+        kwargs: { sigma: 2.0, q: 2.0 }
+```
+
+How it works in code:
+- Config injection: `ConfigManager` reads `auxiliary_tasks` and calls a small factory to append derived targets into `mgr.targets` with `auxiliary_task: true` and a reference to `source_target`.
+- Dataset loading: Datasets only load label volumes for primary targets. Auxiliary targets do not require separate label files and are not looked up on disk.
+- Loss computation: During training, losses are computed per key present in the batch label dict. The helper `compute_auxiliary_loss` passes `source_pred=outputs[source_target]` to losses that accept it. This enables:
+  - Self-consistency/regularization losses that don’t need explicit GT (e.g., `NormalSmoothnessLoss` using only predicted normals with optional masking from `source_pred`).
+  - Losses that need derived GT (e.g., `SignedDistanceLoss`, cosine loss on normals) when the batch provides the corresponding GT tensor.
+  - For deep supervision, auxiliary targets default to `ds_interpolation: linear`, mapping to bilinear (2D) or trilinear (3D) in downsampling to preserve regression continuity.
+
+Important notes and current behavior:
+- The dataset now auto-generates ground-truth tensors for `distance_transform` (signed DT) and `surface_normals` per patch from the `source_target` labels, so related losses work out of the box.
+- Auxiliary losses that are self-supervised or use only predictions (e.g., `NormalSmoothnessLoss`) also work and can be masked using `source_pred` passed through `compute_auxiliary_loss`.
+- If you prefer, you can still precompute and store auxiliary labels on disk using the same naming convention; the dataset will ignore them unless you wire them explicitly.
+
+This design allows mixing fully supervised targets with auxiliary/self-supervised regularizers and keeps disk I/O simple by deriving common auxiliary targets on the fly.
 
 4. **Mixed Precision Training**:
    - GradScaler for CUDA devices

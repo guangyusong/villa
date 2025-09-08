@@ -628,7 +628,7 @@ class BaseDataset(Dataset):
                         blur_sigma=(0.5, 1.5),
                         synchronize_channels=False,
                         synchronize_axes=False,
-                        p_per_channel=0.5, benchmark=True
+                        p_per_channel=0.5, benchmark=False
                     ), apply_probability=0.4
                 ))
 
@@ -735,7 +735,7 @@ class BaseDataset(Dataset):
                         blur_sigma=(0.5, 1.5),
                         synchronize_channels=False,
                         synchronize_axes=False,
-                        p_per_channel=0.5, benchmark=True
+                        p_per_channel=0.5, benchmark=False
                     ), apply_probability=0.4
                 ))
 

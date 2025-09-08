@@ -66,13 +66,14 @@ def compute_auxiliary_loss(loss_fn, t_pred: torch.Tensor, t_gt_masked: torch.Ten
     torch.Tensor
         Computed loss value
     """
-    # Check if this is a skeleton-aware loss
-    loss_name = loss_fn.__class__.__name__ if hasattr(loss_fn, '__class__') else str(loss_fn)
+    # Check if this is a skeleton-aware loss. Support DeepSupervisionWrapper by peeking at wrapped loss
+    base_loss = getattr(loss_fn, 'loss', loss_fn)
+    loss_name = base_loss.__class__.__name__ if hasattr(base_loss, '__class__') else str(base_loss)
     skeleton_losses = ['DC_SkelREC_and_CE_loss', 'SoftSkeletonRecallLoss']
     
     if loss_name in skeleton_losses:
         if skeleton_data is not None:
-            # Pass skeleton data as third argument for skeleton-aware losses
+            # Pass skeleton data as third argument (DeepSupervisionWrapper will forward it)
             result = loss_fn(t_pred, t_gt_masked, skeleton_data)
         else:
             # For skeleton losses, we must have skeleton data

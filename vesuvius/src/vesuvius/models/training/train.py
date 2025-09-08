@@ -16,6 +16,7 @@ from datetime import datetime
 from tqdm import tqdm
 import numpy as np
 import torch
+import torch.nn.functional as F
 from vesuvius.models.training.lr_schedulers import get_scheduler, PolyLRScheduler
 from torch.utils.data import DataLoader, SubsetRandomSampler
 from vesuvius.models.utils import InitWeights_He
@@ -24,6 +25,7 @@ from vesuvius.utils.plotting import save_debug
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 
 from vesuvius.models.training.loss.losses import _create_loss
+from vesuvius.models.training.loss.nnunet_losses import DeepSupervisionWrapper
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.save_checkpoint import (
     save_checkpoint,
@@ -140,6 +142,10 @@ class BaseTrainer:
                             pos_weight=pos_weight,
                             mgr=self.mgr
                         )
+                        # If deep supervision is enabled, wrap the loss in nnUNet-style DS wrapper
+                        if getattr(self.mgr, 'enable_deep_supervision', False) and getattr(self, '_ds_weights', None) is not None:
+                            # Wrap all losses incl. skeleton-aware; wrapper now forwards extra args
+                            loss_fn = DeepSupervisionWrapper(loss_fn, self._ds_weights)
                         
                         if start_epoch > 0:
                             # Store for later addition
@@ -163,6 +169,113 @@ class BaseTrainer:
                 self._deferred_losses[task_name] = deferred_losses
 
         return loss_fns
+
+    # --- deep supervision helpers --- #
+    def _set_deep_supervision_enabled(self, model, enabled: bool):
+        if not hasattr(model, 'task_decoders'):
+            return
+        for _, dec in model.task_decoders.items():
+            if hasattr(dec, 'deep_supervision'):
+                dec.deep_supervision = enabled
+
+    def _get_deep_supervision_scales(self, model):
+        cfg = getattr(model, 'final_config', {})
+        pool_kernels = cfg.get('pool_op_kernel_sizes', None)
+        if pool_kernels is None:
+            return None
+        arr = np.vstack(pool_kernels)
+        # 1 / cumprod of pooling kernels, drop the last (lowest resolution not used for logits loss weight)
+        scales = list(list(i) for i in 1 / np.cumprod(arr, axis=0))[:-1]
+        return scales
+
+    def _compute_ds_weights(self, n: int):
+        if n <= 0:
+            return None
+        weights = np.array([1 / (2 ** i) for i in range(n)], dtype=np.float32)
+        # Do not use the lowest resolution output
+        weights[-1] = 0.0
+        s = weights.sum()
+        if s > 0:
+            weights = weights / s
+        return weights.tolist()
+
+    def _get_interp_mode_for_target(self, target_name: str, ndim: int):
+        """Return (mode, align_corners) for F.interpolate based on YAML ds_interpolation and dims.
+        Supported values:
+          - 'nearest' (default)
+          - 'linear' (mapped to 'bilinear' in 2D, 'trilinear' in 3D)
+          - 'bilinear' (2D only; 3D -> 'trilinear')
+          - 'trilinear' (3D only; 2D -> 'bilinear')
+          - 'area' (2D only; 3D falls back to 'nearest')
+        """
+        cfg = self.mgr.targets.get(target_name, {}) if hasattr(self.mgr, 'targets') else {}
+        req = str(cfg.get('ds_interpolation', 'nearest')).lower()
+
+        # Default
+        mode = 'nearest'
+        align = None
+
+        if req == 'nearest':
+            return 'nearest', None
+
+        if req in ('linear', 'bilinear', 'trilinear'):
+            if ndim == 4:  # BCHW (2D)
+                mode = 'bilinear'
+            elif ndim == 5:  # BCDHW (3D)
+                mode = 'trilinear'
+            align = False
+            return mode, align
+
+        if req == 'area':
+            if ndim == 4:
+                return 'area', None
+            else:
+                # area not supported for 3D, fall back safe
+                return 'nearest', None
+
+        # Fallback safe
+        return 'nearest', None
+
+    def _downsample_targets_for_ds(self, outputs, targets_dict):
+        """Downsample ground truth targets to match deep supervision outputs.
+        Only modifies keys that are predicted (present in outputs).
+        Returns a copy of targets_dict with lists of tensors per key.
+        """
+        if getattr(self, '_ds_scales', None) is None:
+            return targets_dict
+        new_targets = dict(targets_dict)
+        for t_name, pred in outputs.items():
+            # Skip if no ground truth for this prediction (e.g., auxiliary outputs not supervised)
+            if t_name not in targets_dict:
+                continue
+            # Only act if the network returns deep supervision (list) for this output
+            if isinstance(pred, (list, tuple)):
+                base_t = targets_dict[t_name]
+                if base_t.ndim not in (4, 5):  # BCHW or BCDHW
+                    continue
+                ds_targets = []
+                mode, align_corners = self._get_interp_mode_for_target(t_name, base_t.ndim)
+                for s in self._ds_scales:
+                    # interpolate targets per selected mode
+                    if align_corners is None:
+                        ds_t = F.interpolate(base_t.float(), scale_factor=s, mode=mode)
+                    else:
+                        ds_t = F.interpolate(base_t.float(), scale_factor=s, mode=mode, align_corners=align_corners)
+                    ds_targets.append(ds_t.to(base_t.dtype))
+                new_targets[t_name] = ds_targets
+
+                # Also downsample associated skeleton target if present
+                skel_key = f"{t_name}_skel"
+                if skel_key in targets_dict:
+                    base_skel = targets_dict[skel_key]
+                    if base_skel.ndim in (4, 5):
+                        ds_skels = []
+                        for s in self._ds_scales:
+                            # keep skeletons as nearest to preserve topology
+                            ds_s = F.interpolate(base_skel.float(), scale_factor=s, mode='nearest')
+                            ds_skels.append(ds_s.to(base_skel.dtype))
+                        new_targets[skel_key] = ds_skels
+        return new_targets
 
     def _update_scheduler_for_epoch(self, scheduler, optimizer, epoch):
         """
@@ -386,6 +499,16 @@ class BaseTrainer:
 
         self.mgr.auto_detect_channels(train_dataset)
         model = self._build_model()
+
+        # Deep supervision setup (enable on decoders, compute scales & weights)
+        self._ds_scales = None
+        self._ds_weights = None
+        if getattr(self.mgr, 'enable_deep_supervision', False):
+            self._set_deep_supervision_enabled(model, True)
+            self._ds_scales = self._get_deep_supervision_scales(model)
+            if self._ds_scales is not None:
+                self._ds_weights = self._compute_ds_weights(len(self._ds_scales))
+
         optimizer = self._get_optimizer(model)
         loss_fns = self._build_loss()
         scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
@@ -513,6 +636,10 @@ class BaseTrainer:
         }
         
         outputs = model(inputs)
+
+        # If deep supervision is enabled, prepare lists of downsampled targets
+        if getattr(self.mgr, 'enable_deep_supervision', False):
+            targets_dict = self._downsample_targets_for_ds(outputs, targets_dict)
         
         return inputs, targets_dict, outputs
 
@@ -572,7 +699,14 @@ class BaseTrainer:
                 # TODO: rework this janky setup to make it more clear
                 # Get skeleton data if available
                 skeleton_data = targets_dict.get(f'{t_name}_skel', None)
-                loss_value = compute_auxiliary_loss(loss_fn, t_pred, t_gt, outputs,
+                # If DS is enabled and loss isn't wrapped (edge case), fall back to highest-res
+                pred_for_loss, gt_for_loss = t_pred, t_gt
+                if isinstance(t_pred, (list, tuple)) and not isinstance(loss_fn, DeepSupervisionWrapper):
+                    pred_for_loss = t_pred[0]
+                    if isinstance(t_gt, (list, tuple)):
+                        gt_for_loss = t_gt[0]
+
+                loss_value = compute_auxiliary_loss(loss_fn, pred_for_loss, gt_for_loss, outputs,
                                                     self.mgr.targets[t_name], skeleton_data)
                 task_total_loss += loss_weight * loss_value
 
@@ -603,6 +737,8 @@ class BaseTrainer:
 
         with context:
             outputs = model(inputs)
+            if getattr(self.mgr, 'enable_deep_supervision', False):
+                targets_dict = self._downsample_targets_for_ds(outputs, targets_dict)
             task_losses = self._compute_validation_loss(outputs, targets_dict, loss_fns)
         
         return task_losses, inputs, targets_dict, outputs
@@ -620,7 +756,14 @@ class BaseTrainer:
             for loss_fn, loss_weight in task_loss_fns:
                 # Get skeleton data if available
                 skeleton_data = targets_dict.get(f'{t_name}_skel', None)
-                loss_value = compute_auxiliary_loss(loss_fn, t_pred, t_gt, outputs,
+                # If DS is enabled and loss isn't wrapped (edge case), fall back to highest-res
+                pred_for_loss, gt_for_loss = t_pred, t_gt
+                if isinstance(t_pred, (list, tuple)) and not isinstance(loss_fn, DeepSupervisionWrapper):
+                    pred_for_loss = t_pred[0]
+                    if isinstance(t_gt, (list, tuple)):
+                        gt_for_loss = t_gt[0]
+
+                loss_value = compute_auxiliary_loss(loss_fn, pred_for_loss, gt_for_loss, outputs,
                                                     self.mgr.targets[t_name], skeleton_data)
                 task_total_loss += loss_weight * loss_value
 

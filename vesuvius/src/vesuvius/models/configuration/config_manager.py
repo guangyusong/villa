@@ -82,6 +82,8 @@ class ConfigManager:
         self.train_patch_size = tuple(self.tr_configs.get("patch_size", [192, 192, 192]))
         self.in_channels = 1
         self.train_batch_size = int(self.tr_configs.get("batch_size", 2))
+        # Enable nnUNet-style deep supervision (disabled by default)
+        self.enable_deep_supervision = bool(self.tr_configs.get("enable_deep_supervision", False))
         self.gradient_accumulation = int(self.tr_configs.get("gradient_accumulation", 1))
         self.max_steps_per_epoch = int(self.tr_configs.get("max_steps_per_epoch", 200))
         self.max_val_steps_per_epoch = int(self.tr_configs.get("max_val_steps_per_epoch", 25))

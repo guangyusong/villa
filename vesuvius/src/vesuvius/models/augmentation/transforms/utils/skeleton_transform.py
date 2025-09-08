@@ -20,9 +20,16 @@ class MedialSurfaceTransform(BasicTransform):
         self.do_close = do_close
 
     def apply(self, data_dict, **params):
-        # Find target keys (exclude 'image' and 'is_unlabeled')
-        target_keys = [k for k in data_dict.keys() if k not in ['image', 'is_unlabeled']]
-        
+        # Collect regression keys to avoid processing continuous aux targets
+        regression_keys = set(data_dict.get('regression_keys', []) or [])
+        # Find eligible target keys: tensor-valued, not image/meta, not regression aux
+        target_keys = [
+            k for k, v in data_dict.items()
+            if k not in ['image', 'is_unlabeled', 'regression_keys']
+            and isinstance(v, torch.Tensor)
+            and k not in regression_keys
+        ]
+
         # Process each target
         for target_key in target_keys:
             t = data_dict[target_key]

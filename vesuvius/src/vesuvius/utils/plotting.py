@@ -6,6 +6,35 @@ from PIL import Image, ImageDraw
 import multiprocessing as mp
 
 
+# Worker must be at module scope for multiprocessing pickling (spawn context)
+def _save_gif_worker(frames_list, path, _fps):
+    try:
+        if not frames_list:
+            # No frames to write; treat as success but nothing done
+            return
+        pil_frames = []
+        for frame in frames_list:
+            if frame.dtype != np.uint8:
+                frame = frame.astype(np.uint8)
+            if not frame.flags['C_CONTIGUOUS']:
+                frame = np.ascontiguousarray(frame)
+            pil_frames.append(Image.fromarray(frame))
+        pil_frames[0].save(
+            path,
+            save_all=True,
+            append_images=pil_frames[1:],
+            duration=max(1, 1000 // max(1, _fps)),
+            loop=0,
+        )
+        for pf in pil_frames:
+            pf.close()
+    except Exception:
+        # Ensure non-zero exit code on failure so parent can detect it
+        import sys, traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
 def minmax_scale_to_8bit(arr_np):
     """Convert array to 8-bit by scaling to 0-255 range"""
     # Ensure float32 for computation
@@ -328,30 +357,6 @@ def save_debug(
         out_dir = Path(save_path).parent
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"[Epoch {epoch}] Saving GIF to: {save_path}")
-
-        def _save_gif_worker(frames_list, path, _fps):
-            try:
-                if not frames_list:
-                    return 1
-                pil_frames = []
-                for frame in frames_list:
-                    if frame.dtype != np.uint8:
-                        frame = frame.astype(np.uint8)
-                    if not frame.flags['C_CONTIGUOUS']:
-                        frame = np.ascontiguousarray(frame)
-                    pil_frames.append(Image.fromarray(frame))
-                pil_frames[0].save(
-                    path,
-                    save_all=True,
-                    append_images=pil_frames[1:],
-                    duration=max(1, 1000//max(1, _fps)),
-                    loop=0
-                )
-                for pf in pil_frames:
-                    pf.close()
-                return 0
-            except Exception:
-                return 2
 
         # Use spawn context for better isolation
         ctx = mp.get_context("spawn")

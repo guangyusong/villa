@@ -11,7 +11,9 @@ from multiprocessing import Pool, cpu_count
 from functools import partial
 from vesuvius.models.training.auxiliary_tasks import (
     compute_distance_transform,
-    compute_surface_normals_from_sdt
+    compute_surface_normals_from_sdt,
+    compute_structure_tensor,
+    compute_inplane_direction,
 )
 from vesuvius.models.augmentation.transforms.spatial.transpose import TransposeAxesTransform
 # Augmentations will be handled directly in this file
@@ -559,19 +561,21 @@ class BaseDataset(Dataset):
                     binary_mask = (src_patch[0] > 0).astype(np.uint8)
 
                 if task_type == 'distance_transform':
-                    # Prefer signed distance transform for compatibility with SignedDistanceLoss
-                    # Compute inside/outside distances and take outside - inside
+                    # Compute distances according to requested type: 'signed' | 'inside' | 'outside'
                     from scipy.ndimage import distance_transform_edt
                     inside = distance_transform_edt(binary_mask)
                     outside = distance_transform_edt(1 - binary_mask)
-                    sdt = (outside - inside).astype(np.float32)
+                    dist_type = str(tinfo.get('distance_type', 'signed')).lower()
+
+                    if dist_type == 'inside':
+                        distance = inside.astype(np.float32)
+                    elif dist_type == 'outside':
+                        distance = outside.astype(np.float32)
+                    else:  # 'signed' (default)
+                        distance = (outside - inside).astype(np.float32)
 
                     # Add channel dimension (1, ...)
-                    if self.is_2d_dataset:
-                        aux_patch = sdt[np.newaxis, ...]
-                    else:
-                        aux_patch = sdt[np.newaxis, ...]
-
+                    aux_patch = distance[np.newaxis, ...]
                     aux_patch = np.ascontiguousarray(aux_patch, dtype=np.float32)
                     result[aux_name] = torch.from_numpy(aux_patch)
                     regression_keys.append(aux_name)
@@ -580,6 +584,28 @@ class BaseDataset(Dataset):
                     # Compute normals from SDT; returns (2,H,W) for 2D or (3,D,H,W) for 3D
                     normals, _ = compute_surface_normals_from_sdt(binary_mask, is_2d=self.is_2d_dataset, return_sdt=False)
                     aux_patch = np.ascontiguousarray(normals, dtype=np.float32)
+                    result[aux_name] = torch.from_numpy(aux_patch)
+                    regression_keys.append(aux_name)
+                elif task_type == 'structure_tensor':
+                    aux_patch = compute_structure_tensor(
+                        binary_mask,
+                        self.is_2d_dataset,
+                        compute_from=str(tinfo.get('compute_from', 'sdt')).lower(),
+                        grad_sigma=float(tinfo.get('grad_sigma', 1.0)),
+                        tensor_sigma=float(tinfo.get('tensor_sigma', 1.5)),
+                        ignore_index=tinfo.get('ignore_index', -100),
+                    )
+                    result[aux_name] = torch.from_numpy(aux_patch)
+                    regression_keys.append(aux_name)
+                elif task_type == 'inplane_direction':
+                    aux_patch = compute_inplane_direction(
+                        binary_mask,
+                        self.is_2d_dataset,
+                        compute_from=str(tinfo.get('compute_from', 'sdt')).lower(),
+                        grad_sigma=float(tinfo.get('grad_sigma', 1.0)),
+                        tensor_sigma=float(tinfo.get('tensor_sigma', 1.5)),
+                        ignore_index=tinfo.get('ignore_index', -100),
+                    )
                     result[aux_name] = torch.from_numpy(aux_patch)
                     regression_keys.append(aux_name)
                 else:

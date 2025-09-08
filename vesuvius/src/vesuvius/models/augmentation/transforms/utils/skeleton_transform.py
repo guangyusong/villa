@@ -25,7 +25,9 @@ class MedialSurfaceTransform(BasicTransform):
         
         # Process each target
         for target_key in target_keys:
-            seg_all = data_dict[target_key].numpy()
+            t = data_dict[target_key]
+            orig_device = t.device
+            seg_all = t.detach().cpu().numpy()
             # Add tubed skeleton GT
             bin_seg = (seg_all > 0)
             seg_all_skel = np.zeros_like(bin_seg, dtype=np.float32)
@@ -56,6 +58,6 @@ class MedialSurfaceTransform(BasicTransform):
                 seg_all_skel[0] = skel
 
             # Store skeleton for each target with a unique key
-            data_dict[f"{target_key}_skel"] = torch.from_numpy(seg_all_skel)
+            data_dict[f"{target_key}_skel"] = torch.from_numpy(seg_all_skel).to(orig_device)
         
         return data_dict

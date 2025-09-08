@@ -337,7 +337,7 @@ class BaseDataset(Dataset):
 
         bbox_threshold = getattr(self.mgr, 'min_bbox_percent', 0.97)
         downsample_level = getattr(self.mgr, 'downsample_level', 1)
-        num_workers = getattr(self.mgr, 'num_workers', 4)
+        num_workers = getattr(self.mgr, 'num_workers', 8)
 
         if self.cache_enabled and len(self.zarr_arrays) > 0:
             cached_patches = load_cached_patches(
@@ -571,7 +571,7 @@ class BaseDataset(Dataset):
                     self.mgr.train_patch_size,
                     patch_center_dist_from_border=0,
                     random_crop=False,
-                    p_elastic_deform=0.75,
+                    p_elastic_deform=0,
                     p_rotation=0.5,
                     rotation=rotation_for_DA,
                     p_scaling=0.2,
@@ -836,7 +836,8 @@ class BaseDataset(Dataset):
         patch_info = self.valid_patches[index]
         data_dict = self._extract_patch(patch_info)
 
-        if self.transforms is not None:
+        # Apply CPU-side transforms only if not deferring to on-device augmentation
+        if self.transforms is not None and not (self.is_training and getattr(self.mgr, 'augment_on_device', False)):
             data_dict = self.transforms(**data_dict)
-        
+
         return data_dict

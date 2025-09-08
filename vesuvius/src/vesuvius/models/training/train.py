@@ -448,6 +448,7 @@ class BaseTrainer:
             sampler=SubsetRandomSampler(train_indices),
             pin_memory=(True if self.device == 'cuda' else False),
             num_workers=self.mgr.train_num_dataloader_workers,
+            prefetch_factor=2
         )
 
         val_dataloader = DataLoader(
@@ -470,6 +471,8 @@ class BaseTrainer:
         # we put augmentations in the dataset class so we can use the __getitem__ method
         # for free multi processing of augmentations 
         train_dataset = self._configure_dataset(is_training=True)
+        # Keep a handle to the training dataset for on-device augmentation
+        self._train_dataset = train_dataset
 
         # Build validation dataset; support separate directory via mgr.val_data_path
         if hasattr(self.mgr, 'val_data_path') and self.mgr.val_data_path is not None:
@@ -643,6 +646,36 @@ class BaseTrainer:
         
         return inputs, targets_dict, outputs
 
+    def _apply_transforms_per_sample(self, tfm, batched_dict):
+        """Apply a ComposeTransforms pipeline to each sample in a batched dict.
+        Expects tensors shaped [B, C, ...]. Returns a new batched dict with tensors stacked on dim 0.
+        Non-tensor fields that are lists/tuples of length B are passed per-sample and returned as lists.
+        """
+        if 'image' not in batched_dict or not isinstance(batched_dict['image'], torch.Tensor):
+            return batched_dict
+        B = batched_dict['image'].shape[0]
+        out_accum = {}
+        for b in range(B):
+            sample = {}
+            for k, v in batched_dict.items():
+                if isinstance(v, torch.Tensor) and v.shape[0] == B:
+                    sample[k] = v[b]
+                elif isinstance(v, (list, tuple)) and len(v) == B:
+                    sample[k] = v[b]
+                else:
+                    sample[k] = v
+            sample_out = tfm(**sample)
+            for k, v in sample_out.items():
+                out_accum.setdefault(k, []).append(v)
+
+        batched_out = {}
+        for k, vals in out_accum.items():
+            if isinstance(vals[0], torch.Tensor):
+                batched_out[k] = torch.stack(vals, dim=0)
+            else:
+                batched_out[k] = vals
+        return batched_out
+
     def _train_step(self, model, data_dict, loss_fns, use_amp, autocast_ctx, epoch, step, verbose=False,
                     scaler=None, optimizer=None, num_iters=None, grad_accumulate_n=1):
         """Execute a single training step including gradient updates."""
@@ -659,8 +692,27 @@ class BaseTrainer:
                 else:
                     print(f"{item}: {val.dtype}, {val.shape}, min {val.min()} max {val.max()}")
 
+        # Optionally run augmentations on the model device instead of Dataset workers
+        if getattr(self.mgr, 'augment_on_device', False) and getattr(self, '_train_dataset', None) is not None:
+            tfm = getattr(self._train_dataset, 'transforms', None)
+            if tfm is None:
+                data_for_forward = data_dict
+            else:
+                # Move tensors to device
+                dd = {}
+                for k, v in data_dict.items():
+                    dd[k] = v.to(self.device) if isinstance(v, torch.Tensor) else v
+
+                # Apply transforms per-sample (transforms expect unbatched (C, ...) tensors)
+                try:
+                    data_for_forward = self._apply_transforms_per_sample(tfm, dd)
+                except Exception as e:
+                    raise RuntimeError(f"On-device augmentation failed: {e}")
+        else:
+            data_for_forward = data_dict
+
         with autocast_ctx:
-            inputs, targets_dict, outputs = self._get_model_outputs(model, data_dict)
+            inputs, targets_dict, outputs = self._get_model_outputs(model, data_for_forward)
             total_loss, task_losses = self._compute_train_loss(outputs, targets_dict, loss_fns)
 
         # Handle gradient accumulation, clipping, and optimizer step
@@ -965,32 +1017,40 @@ class BaseTrainer:
                 if i == 0 and train_sample_input is None:
                     # Find first sample with non-zero target, but capture even if all zeros
                     first_target_key = list(targets_dict.keys())[0]
-                    first_target = targets_dict[first_target_key]
-                    
+                    first_target_any = targets_dict[first_target_key]
+                    # Handle deep supervision lists
+                    first_target_tensor = first_target_any[0] if isinstance(first_target_any, (list, tuple)) else first_target_any
+
                     b_idx = 0
                     found_non_zero = False
-                    for b in range(first_target.shape[0]):
-                        if torch.any(first_target[b] != 0):
+                    for b in range(first_target_tensor.shape[0]):
+                        if torch.any(first_target_tensor[b] != 0):
                             b_idx = b
                             found_non_zero = True
                             break
-                    
+
                     # Always capture training sample for debug gif, even if all zeros
-                    # This ensures visualization works with limited labeled data
-                    if True:  # Was: if found_non_zero:
+                    if True:
                         train_sample_input = inputs[b_idx: b_idx + 1]
-                        # First collect all targets including skel
+                        # First collect all targets including skel (handle DS lists)
                         train_sample_targets_all = {}
-                        for t_name, t_tensor in targets_dict.items():
-                            train_sample_targets_all[t_name] = t_tensor[b_idx: b_idx + 1]
+                        for t_name, t_val in targets_dict.items():
+                            if isinstance(t_val, (list, tuple)):
+                                train_sample_targets_all[t_name] = t_val[0][b_idx: b_idx + 1]
+                            else:
+                                train_sample_targets_all[t_name] = t_val[b_idx: b_idx + 1]
                         # Now create train_sample_targets without skel and is_unlabeled for save_debug
                         train_sample_targets = {}
                         for t_name, t_tensor in train_sample_targets_all.items():
                             if t_name not in ['skel', 'is_unlabeled']:
                                 train_sample_targets[t_name] = t_tensor
+                        # Collect outputs (handle DS lists)
                         train_sample_outputs = {}
-                        for t_name, p_tensor in outputs.items():
-                            train_sample_outputs[t_name] = p_tensor[b_idx: b_idx + 1]
+                        for t_name, p_val in outputs.items():
+                            if isinstance(p_val, (list, tuple)):
+                                train_sample_outputs[t_name] = p_val[0][b_idx: b_idx + 1]
+                            else:
+                                train_sample_outputs[t_name] = p_val[b_idx: b_idx + 1]
 
                 if optimizer_stepped and is_per_iteration_scheduler:
                     scheduler.step()

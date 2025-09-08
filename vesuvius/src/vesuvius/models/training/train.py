@@ -280,14 +280,8 @@ class BaseTrainer:
 
 
         if device_type == 'cuda' and use_amp:
-            # Use GradScaler for both float16 and bfloat16
-            # even though according to every single thing i've read you dont need grad scaling with bf16
-            # my model learns essentially nothing with it disabled. i have no idea why.
-            if torch.cuda.is_bf16_supported():
-                print("bfloat16 is supported, grad scaling is not required. using DummyScaler")
-                return DummyScaler()
-            else:
-                print("Using GradScaler with float16 autocast")
+            # Use standard GradScaler when AMP is enabled on CUDA
+            print("Using GradScaler with CUDA AMP")
             return torch.amp.GradScaler('cuda')
         else:
             # Not using amp or not on cuda - no gradient scaling needed
@@ -601,13 +595,9 @@ class BaseTrainer:
 
         if use_amp:
             if self.device.type == 'cuda':
-                if torch.cuda.is_bf16_supported():
-                    context = torch.amp.autocast('cuda', dtype=torch.bfloat16)
-                else:
-                    context = torch.amp.autocast('cuda')
+                context = torch.amp.autocast('cuda')
             else:
                 context = torch.amp.autocast(self.device.type)
-            
         else:
             context = nullcontext()
 
@@ -799,12 +789,9 @@ class BaseTrainer:
                 data_dict = next(train_iter)
                 global_step += 1
                 
-                # Setup autocast context
+                # Setup autocast context (no explicit dtype overrides)
                 if use_amp and self.device.type == 'cuda':
-                    if torch.cuda.is_bf16_supported():
-                        autocast_ctx = torch.amp.autocast('cuda', dtype=torch.bfloat16)
-                    else:
-                        autocast_ctx = torch.amp.autocast('cuda')
+                    autocast_ctx = torch.amp.autocast('cuda')
                 elif use_amp and self.device.type in ['cpu', 'mlx']:
                     autocast_ctx = torch.amp.autocast(self.device.type)
                 else:

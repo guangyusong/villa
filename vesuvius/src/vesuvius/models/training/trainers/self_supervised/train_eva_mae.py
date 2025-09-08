@@ -185,10 +185,7 @@ class TrainEVAMAE(BaseTrainer):
         
         if use_amp:
             if self.device.type == 'cuda':
-                if torch.cuda.is_bf16_supported():
-                    context = torch.amp.autocast('cuda', dtype=torch.bfloat16)
-                else:
-                    context = torch.amp.autocast('cuda')
+                context = torch.amp.autocast('cuda')
             else:
                 context = torch.amp.autocast(self.device.type)
         else:

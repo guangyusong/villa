@@ -530,6 +530,65 @@ class BaseDataset(Dataset):
         # Convert all label patches to tensors
         for t_name, label_patch in label_patches.items():
             result[t_name] = torch.from_numpy(label_patch)
+
+        # --- Auto-generate auxiliary targets from source labels, if configured ---
+        # We generate ground-truth for auxiliary tasks (e.g., distance_transform, surface_normals)
+        # based on their declared source_target. This enables related regression/regularization
+        # losses to run without having to precompute and store aux labels on disk.
+        try:
+            regression_keys = []
+            for aux_name, tinfo in getattr(self.mgr, 'targets', {}).items():
+                if not tinfo.get('auxiliary_task', False):
+                    continue
+
+                source_t = tinfo.get('source_target')
+                if not source_t or source_t not in label_patches:
+                    # Source not available in this batch (or not configured)
+                    continue
+
+                task_type = tinfo.get('task_type', '').lower()
+                src_patch = label_patches[source_t]  # numpy array, shape (C, ...) float32
+
+                # Build a binary mask from the first channel of the source label
+                # Foreground is > 0 in our label convention
+                if self.is_2d_dataset:
+                    # (C, H, W) -> (H, W)
+                    binary_mask = (src_patch[0] > 0).astype(np.uint8)
+                else:
+                    # (C, D, H, W) -> (D, H, W)
+                    binary_mask = (src_patch[0] > 0).astype(np.uint8)
+
+                if task_type == 'distance_transform':
+                    # Prefer signed distance transform for compatibility with SignedDistanceLoss
+                    # Compute inside/outside distances and take outside - inside
+                    from scipy.ndimage import distance_transform_edt
+                    inside = distance_transform_edt(binary_mask)
+                    outside = distance_transform_edt(1 - binary_mask)
+                    sdt = (outside - inside).astype(np.float32)
+
+                    # Add channel dimension (1, ...)
+                    if self.is_2d_dataset:
+                        aux_patch = sdt[np.newaxis, ...]
+                    else:
+                        aux_patch = sdt[np.newaxis, ...]
+
+                    aux_patch = np.ascontiguousarray(aux_patch, dtype=np.float32)
+                    result[aux_name] = torch.from_numpy(aux_patch)
+                    regression_keys.append(aux_name)
+
+                elif task_type == 'surface_normals':
+                    # Compute normals from SDT; returns (2,H,W) for 2D or (3,D,H,W) for 3D
+                    normals, _ = compute_surface_normals_from_sdt(binary_mask, is_2d=self.is_2d_dataset, return_sdt=False)
+                    aux_patch = np.ascontiguousarray(normals, dtype=np.float32)
+                    result[aux_name] = torch.from_numpy(aux_patch)
+                    regression_keys.append(aux_name)
+                else:
+                    # Unknown auxiliary type; skip gracefully
+                    continue
+            if regression_keys:
+                result['regression_keys'] = regression_keys
+        except Exception as e:
+            print(f"Warning: Failed to generate auxiliary targets for patch index {index}: {e}")
         
         return result
 

@@ -260,6 +260,7 @@ Auxiliary tasks let you add side objectives that are derived from a primary “s
 
 - Configuration: Add an `auxiliary_tasks` block to your YAML. Each entry must specify:
   - `type`: One of `distance_transform`, `surface_normals`.
+  - Also supported: `structure_tensor` for supervising tensor components.
   - `source_target`: The primary target name to derive from (e.g., `ink`, `surface`).
   - `losses`: List of losses and weights for the auxiliary head.
   - `loss_weight`: Optional overall weight for the task.
@@ -280,6 +281,8 @@ auxiliary_tasks:
     type: distance_transform
     source_target: surface
     loss_weight: 0.10
+    # Choose which distance to predict: 'signed' | 'inside' | 'outside'
+    distance_type: signed
     losses:
       - name: "SignedDistanceLoss"
         weight: 1.0
@@ -301,12 +304,50 @@ auxiliary_tasks:
         kwargs: { sigma: 2.0, q: 2.0 }
 ```
 
+Structure tensor example:
+
+```yaml
+auxiliary_tasks:
+  structure_tensor:
+    type: structure_tensor
+    source_target: surface
+    # Compute from: 'sdt' (signed distance transform) or 'binary' mask
+    compute_from: sdt
+    grad_sigma: 1.0       # pre-gradient smoothing
+    tensor_sigma: 1.5     # post-tensor smoothing
+    loss_weight: 0.1
+    losses:
+      - name: "MaskedMSELoss"
+        weight: 1.0
+        kwargs:
+          ignore_index: -100
+```
+
+In-plane direction example:
+
+```yaml
+auxiliary_tasks:
+  inplane_direction:
+    type: inplane_direction
+    source_target: surface
+    compute_from: sdt    # or 'binary'
+    grad_sigma: 1.0
+    tensor_sigma: 1.5
+    loss_weight: 0.1
+    losses:
+      - name: "MaskedMSELoss"
+        weight: 1.0
+        kwargs:
+          ignore_index: -100
+```
+
 How it works in code:
 - Config injection: `ConfigManager` reads `auxiliary_tasks` and calls a small factory to append derived targets into `mgr.targets` with `auxiliary_task: true` and a reference to `source_target`.
 - Dataset loading: Datasets only load label volumes for primary targets. Auxiliary targets do not require separate label files and are not looked up on disk.
 - Loss computation: During training, losses are computed per key present in the batch label dict. The helper `compute_auxiliary_loss` passes `source_pred=outputs[source_target]` to losses that accept it. This enables:
   - Self-consistency/regularization losses that don’t need explicit GT (e.g., `NormalSmoothnessLoss` using only predicted normals with optional masking from `source_pred`).
-  - Losses that need derived GT (e.g., `SignedDistanceLoss`, cosine loss on normals) when the batch provides the corresponding GT tensor.
+  - Losses that need derived GT (e.g., `SignedDistanceLoss`, cosine loss on normals) use the dataset-provided tensors for aux targets.
+  - Tip: If you use `SignedDistanceLoss`, set `distance_type: signed` (default). For `inside`/`outside` distances, use regression losses like `MaskedMSELoss` or `WeightedSmoothL1Loss`.
   - For deep supervision, auxiliary targets default to `ds_interpolation: linear`, mapping to bilinear (2D) or trilinear (3D) in downsampling to preserve regression continuity.
 
 Important notes and current behavior:

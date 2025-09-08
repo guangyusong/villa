@@ -268,9 +268,24 @@ dataset_config:
 
 Auxiliary tasks (e.g., `distance_transform`, `surface_normals`) are derived from a primary target (e.g., `ink`/`surface`) and configured under `auxiliary_tasks` in your YAML.
 
-- Auxiliary labels do not need to exist on disk. The dataset auto-generates signed distance transforms and surface normals per patch from the source target labels.
+- Auxiliary labels do not need to exist on disk. The dataset auto-generates distance transforms and surface normals per patch from the source target labels.
 - If you want to manage them yourself, you can still precompute and save them under `labels/` using the same naming convention (e.g., `image1_distance_transform.tif`), but it is not required.
 - Auxiliary losses that operate without explicit GT (e.g., `NormalSmoothnessLoss`) can be used without extra labels; masking can be driven by the source task prediction during training.
+
+Example config for distance transform type:
+
+```yaml
+auxiliary_tasks:
+  distance_transform:
+    type: distance_transform
+    source_target: surface
+    # 'signed' | 'inside' | 'outside'
+    distance_type: signed
+```
+
+Notes:
+- Use `signed` with `SignedDistanceLoss` (default).
+- Use `inside`/`outside` with regression losses such as `MaskedMSELoss` or `WeightedSmoothL1Loss`.
 
 ---
 

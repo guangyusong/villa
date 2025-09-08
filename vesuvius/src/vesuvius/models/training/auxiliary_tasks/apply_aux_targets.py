@@ -36,6 +36,12 @@ def create_auxiliary_task(task_type: str, aux_task_name: str, aux_config: Dict[s
     elif task_type == "surface_normals":
         from .aux_surface_normals import create_surface_normals_config
         return create_surface_normals_config(aux_task_name, aux_config, source_target_name)
+    elif task_type == "structure_tensor":
+        from .aux_structure_tensor import create_structure_tensor_config
+        return create_structure_tensor_config(aux_task_name, aux_config, source_target_name)
+    elif task_type == "inplane_direction":
+        from .aux_inplane_direction import create_inplane_direction_config
+        return create_inplane_direction_config(aux_task_name, aux_config, source_target_name)
     else:
         raise ValueError(f"Unknown auxiliary task type: {task_type}")
 

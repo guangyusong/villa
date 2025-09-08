@@ -375,17 +375,19 @@ class ConfigManager:
                     label_tensor = sample[target_name]
                     
                     # Determine number of channels based on label data
-                    # For binary labels (0/1), we always use 2 channels minimum
-                    unique_values = torch.unique(label_tensor)
-                    num_unique = len(unique_values)
-                    
-                    # Always use at least 2 channels
-                    if num_unique <= 2:
-                        detected_channels = 2
+                    # Regression/continuous aux targets: use channel dimension directly
+                    if label_tensor.dtype.is_floating_point or (label_tensor.ndim >= 3 and label_tensor.shape[0] > 1):
+                        detected_channels = int(label_tensor.shape[0])
                     else:
-                        # Multi-class case - use max value + 1
-                        detected_channels = int(torch.max(label_tensor).item()) + 1
-                        detected_channels = max(detected_channels, 2)
+                        # For discrete labels, infer from unique values
+                        unique_values = torch.unique(label_tensor)
+                        num_unique = len(unique_values)
+                        if num_unique <= 2:
+                            detected_channels = 2
+                        else:
+                            # Multi-class case - use max value + 1
+                            detected_channels = int(torch.max(label_tensor).item()) + 1
+                            detected_channels = max(detected_channels, 2)
                     
                     self.targets[target_name]['out_channels'] = detected_channels
                     targets_updated = True

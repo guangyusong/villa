@@ -1124,13 +1124,19 @@ class BaseTrainer:
                         for t_name, loss_value in task_losses.items():
                             val_losses[t_name].append(loss_value)
                         
-                        # Compute evaluation metrics for each task
+                        # Compute evaluation metrics for each task (handle deep supervision lists)
                         for t_name in self.mgr.targets:
                             if t_name in outputs and t_name in targets_dict:
+                                pred_val = outputs[t_name]
+                                gt_val = targets_dict[t_name]
+                                if isinstance(pred_val, (list, tuple)):
+                                    pred_val = pred_val[0]
+                                if isinstance(gt_val, (list, tuple)):
+                                    gt_val = gt_val[0]
                                 for metric in evaluation_metrics[t_name]:
                                     if isinstance(metric, CriticalComponentsMetric) and i >= 10:
                                         continue
-                                    metric.update(pred=outputs[t_name], gt=targets_dict[t_name])
+                                    metric.update(pred=pred_val, gt=gt_val)
 
                         if i == 0:
                                 # Find first non-zero sample for debug visualization, but save even if all zeros
@@ -1138,7 +1144,8 @@ class BaseTrainer:
                                 found_non_zero = False
 
                                 # Check if the first sample is non-zero
-                                first_target = next(iter(targets_dict.values()))
+                                first_target_any = next(iter(targets_dict.values()))
+                                first_target = first_target_any[0] if isinstance(first_target_any, (list, tuple)) else first_target_any
                                 if torch.any(first_target[0] != 0):
                                     found_non_zero = True
                                 else:
@@ -1156,12 +1163,18 @@ class BaseTrainer:
                                     inputs_first = inputs[b_idx: b_idx + 1]
 
                                     targets_dict_first_all = {}
-                                    for t_name, t_tensor in targets_dict.items():
-                                        targets_dict_first_all[t_name] = t_tensor[b_idx: b_idx + 1]
+                                    for t_name, t_val in targets_dict.items():
+                                        if isinstance(t_val, (list, tuple)):
+                                            targets_dict_first_all[t_name] = t_val[0][b_idx: b_idx + 1]
+                                        else:
+                                            targets_dict_first_all[t_name] = t_val[b_idx: b_idx + 1]
 
                                     outputs_dict_first = {}
-                                    for t_name, p_tensor in outputs.items():
-                                        outputs_dict_first[t_name] = p_tensor[b_idx: b_idx + 1]
+                                    for t_name, p_val in outputs.items():
+                                        if isinstance(p_val, (list, tuple)):
+                                            outputs_dict_first[t_name] = p_val[0][b_idx: b_idx + 1]
+                                        else:
+                                            outputs_dict_first[t_name] = p_val[b_idx: b_idx + 1]
 
                                     debug_img_path = f"{ckpt_dir}/{self.mgr.model_name}_debug_epoch{epoch}.gif"
                                     

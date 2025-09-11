@@ -772,7 +772,7 @@ static double local_solve(SurfaceMeta *sm, const cv::Vec2i &p, SurfTrackerData &
 
 
 static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points, const cv::Rect &used_area,
-    float step, float step_src, bool inpaint = false)
+    float step, float step_src, bool inpaint = false, const std::set<SurfaceMeta*>& approved_sm = std::set<SurfaceMeta*>())
 {
     cv::Mat_<cv::Vec3f> points_hr(state.rows*step, state.cols*step, {0,0,0});
     cv::Mat_<int> counts_hr(state.rows*step, state.cols*step, 0);
@@ -809,7 +809,12 @@ static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat
                         }
                 }
             }
-            if (!counts_hr(j*step+1,i*step+1) && inpaint) {
+            bool approved_here = false;
+            if (!approved_sm.empty()) {
+                const auto &ss = data.surfsC({j,i});
+                for (auto s : ss) { if (approved_sm.contains(s)) { approved_here = true; break; } }
+            }
+            if (!counts_hr(j*step+1,i*step+1) && (inpaint || approved_here)) {
                 const cv::Vec3d& c00 = points(j,i);
                 const cv::Vec3d& c01 = points(j,i+1);
                 const cv::Vec3d& c10 = points(j+1,i);
@@ -999,7 +1004,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     std::cout << "optimizer: rms " << sqrt(summary.final_cost/summary.num_residual_blocks) << " count " << summary.num_residual_blocks << std::endl;
 
     {
-        cv::Mat_<cv::Vec3d> points_hr_inp = surftrack_genpoints_hr(data, new_state, points_inpainted, used_area, step, src_step, true);
+        cv::Mat_<cv::Vec3d> points_hr_inp = surftrack_genpoints_hr(data, new_state, points_inpainted, used_area, step, src_step, true, approved_sm);
         try {
             auto dbg_surf = new QuadSurface(points_hr_inp(used_area_hr), {1/src_step,1/src_step});
             std::string uuid = Z_DBG_GEN_PREFIX+get_surface_time_str()+"_inp_hr";
@@ -1011,7 +1016,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
         }
     }
 
-    cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, new_state, points_inpainted, used_area, step, src_step);
+    cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, new_state, points_inpainted, used_area, step, src_step, false, approved_sm);
     SurfTrackerData data_out;
     cv::Mat_<cv::Vec3d> points_out(points.size(), {-1,-1,-1});
     cv::Mat_<uint8_t> state_out(state.size(), 0);
@@ -1065,6 +1070,19 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                             data_out.surfs({j,i}).insert(s);
                             cv::Vec3f loc = s->surface()->loc_raw(ptr);
                             data_out.loc(s, {j,i}) = {loc[1], loc[0]};
+                            mutex.unlock();
+                        }
+                    }
+
+                    // Force-carry approved surfaces from the original mapping, even if pointTo failed.
+                    // This guarantees approved patches remain represented in the remapped grid and HR.
+                    const std::set<SurfaceMeta*>& prev_surfs = data.surfsC({j,i});
+                    for (auto s : prev_surfs) {
+                        if (approved_sm.contains(s)) {
+                            mutex.lock();
+                            data_out.surfs({j,i}).insert(s);
+                            if (data.has(s, {j,i}))
+                                data_out.loc(s, {j,i}) = data.loc(s, {j,i});
                             mutex.unlock();
                         }
                     }
@@ -1808,72 +1826,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
         if (!global_steps_per_window)
             update_mapping = false;
 
-        if (generation % 50 == 0 || update_mapping /*|| generation < 10*/) {
-            {
-                cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, state, points, used_area, step, src_step);
-                auto dbg_surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
-                dbg_surf->meta = new nlohmann::json;
-                (*dbg_surf->meta)["vc_grow_seg_from_segments_params"] = params;
-
-                float const area_est_vx2 = loc_valid_count*src_step*src_step*step*step;
-                float const area_est_cm2 = area_est_vx2 * voxelsize * voxelsize / 1e8;
-                (*dbg_surf->meta)["area_vx2"] = area_est_vx2;
-                (*dbg_surf->meta)["area_cm2"] = area_est_cm2;
-                (*dbg_surf->meta)["used_approved_segments"] = std::vector<std::string>(used_approved_names.begin(), used_approved_names.end());
-                std::string uuid = Z_DBG_GEN_PREFIX+get_surface_time_str();
-                dbg_surf->save(tgt_dir / uuid, uuid);
-                delete dbg_surf;
-            }
-        }
-
-        //lets just see what happens
-        if (update_mapping) {
-            dbg_counter = generation;
-            SurfTrackerData opt_data = data;
-            cv::Rect all(0,0,w, h);
-            cv::Mat_<uint8_t> opt_state = state.clone();
-            cv::Mat_<cv::Vec3d> opt_points = points.clone();
-
-            cv::Rect active = active_bounds & used_area;
-            optimize_surface_mapping(opt_data, opt_state, opt_points, active, static_bounds, step, src_step, {y0,x0}, closing_r, true, pointto_iterations, tgt_dir, approved_sm);
-            if (active.area() > 0) {
-                copy(opt_data, data, active);
-                opt_points(active).copyTo(points(active));
-                opt_state(active).copyTo(state(active));
-
-                for(int i=0;i<omp_get_max_threads();i++) {
-                    data_ths[i] = data;
-                    added_points_threads[i].resize(0);
-                }
-            }
-
-            last_succ_parametrization = loc_valid_count;
-            //recalc fringe after surface optimization (which often shrinks the surf)
-            fringe.clear();
-            curr_best_inl_th = inlier_base_threshold;
-            for(int j=active.y-2;j<=active.br().y+2;j++)
-                for(int i=active.x-2;i<=active.br().x+2;i++)
-                    if (state(j,i) & STATE_LOC_VALID)
-                        fringe.insert(cv::Vec2i(j,i));
-
-            {
-                cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, state, points, used_area, step, src_step);
-                auto dbg_surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
-                dbg_surf->meta = new nlohmann::json;
-                (*dbg_surf->meta)["vc_grow_seg_from_segments_params"] = params;
-
-                std::string uuid = Z_DBG_GEN_PREFIX+get_surface_time_str()+"_opt";
-                float const area_est_vx2 = loc_valid_count*src_step*src_step*step*step;
-                float const area_est_cm2 = area_est_vx2 * voxelsize * voxelsize / 1e8;
-                (*dbg_surf->meta)["area_vx2"] = area_est_vx2;
-                (*dbg_surf->meta)["area_cm2"] = area_est_cm2;
-                (*dbg_surf->meta)["used_approved_segments"] = std::vector<std::string>(used_approved_names.begin(), used_approved_names.end());
-                dbg_surf->save(tgt_dir / uuid, uuid);
-                delete dbg_surf;
-            }
-        }
-
-        // Perform any pending approved-surface assimilations now (single-threaded, safe).
+        // Perform any pending approved-surface assimilations now (single-threaded, safe) BEFORE periodic dbg save
         if (!pending_assimilations.empty()) {
             // 1) Ensure width is large enough to host the full approved patch span to the right
             int required_w = w;
@@ -1945,6 +1898,73 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
             approved_pause.store(0, std::memory_order_relaxed);
         }
 
+        if (generation % 50 == 0 || update_mapping /*|| generation < 10*/) {
+            {
+                cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, state, points, used_area, step, src_step, false, approved_sm);
+                auto dbg_surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
+                dbg_surf->meta = new nlohmann::json;
+                (*dbg_surf->meta)["vc_grow_seg_from_segments_params"] = params;
+
+                float const area_est_vx2 = loc_valid_count*src_step*src_step*step*step;
+                float const area_est_cm2 = area_est_vx2 * voxelsize * voxelsize / 1e8;
+                (*dbg_surf->meta)["area_vx2"] = area_est_vx2;
+                (*dbg_surf->meta)["area_cm2"] = area_est_cm2;
+                (*dbg_surf->meta)["used_approved_segments"] = std::vector<std::string>(used_approved_names.begin(), used_approved_names.end());
+                std::string uuid = Z_DBG_GEN_PREFIX+get_surface_time_str();
+                dbg_surf->save(tgt_dir / uuid, uuid);
+                delete dbg_surf;
+            }
+        }
+
+        //lets just see what happens
+        if (update_mapping) {
+            dbg_counter = generation;
+            SurfTrackerData opt_data = data;
+            cv::Rect all(0,0,w, h);
+            cv::Mat_<uint8_t> opt_state = state.clone();
+            cv::Mat_<cv::Vec3d> opt_points = points.clone();
+
+            cv::Rect active = active_bounds & used_area;
+            optimize_surface_mapping(opt_data, opt_state, opt_points, active, static_bounds, step, src_step, {y0,x0}, closing_r, true, pointto_iterations, tgt_dir, approved_sm);
+            if (active.area() > 0) {
+                copy(opt_data, data, active);
+                opt_points(active).copyTo(points(active));
+                opt_state(active).copyTo(state(active));
+
+                for(int i=0;i<omp_get_max_threads();i++) {
+                    data_ths[i] = data;
+                    added_points_threads[i].resize(0);
+                }
+            }
+
+            last_succ_parametrization = loc_valid_count;
+            //recalc fringe after surface optimization (which often shrinks the surf)
+            fringe.clear();
+            curr_best_inl_th = inlier_base_threshold;
+            for(int j=active.y-2;j<=active.br().y+2;j++)
+                for(int i=active.x-2;i<=active.br().x+2;i++)
+                    if (state(j,i) & STATE_LOC_VALID)
+                        fringe.insert(cv::Vec2i(j,i));
+
+            {
+                cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, state, points, used_area, step, src_step, false, approved_sm);
+                auto dbg_surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
+                dbg_surf->meta = new nlohmann::json;
+                (*dbg_surf->meta)["vc_grow_seg_from_segments_params"] = params;
+
+                std::string uuid = Z_DBG_GEN_PREFIX+get_surface_time_str()+"_opt";
+                float const area_est_vx2 = loc_valid_count*src_step*src_step*step*step;
+                float const area_est_cm2 = area_est_vx2 * voxelsize * voxelsize / 1e8;
+                (*dbg_surf->meta)["area_vx2"] = area_est_vx2;
+                (*dbg_surf->meta)["area_cm2"] = area_est_cm2;
+                (*dbg_surf->meta)["used_approved_segments"] = std::vector<std::string>(used_approved_names.begin(), used_approved_names.end());
+                dbg_surf->save(tgt_dir / uuid, uuid);
+                delete dbg_surf;
+            }
+        }
+
+        // (Assimilation block moved above periodic save)
+
         float const current_area_vx2 = loc_valid_count*src_step*src_step*step*step;
         float const current_area_cm2 = current_area_vx2 * voxelsize * voxelsize / 1e8;
         printf("gen %d processing %lu fringe cands (total done %d fringe: %lu) area %.0f vx^2 (%f cm^2) best th: %d\n",
@@ -2004,7 +2024,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     float const area_est_cm2 = area_est_vx2 * voxelsize * voxelsize / 1e8;
     std::cout << "area est: " << area_est_vx2 << " vx^2 (" << area_est_cm2 << " cm^2)" << std::endl;
 
-    cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, state, points, used_area, step, src_step);
+    cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, state, points, used_area, step, src_step, false, approved_sm);
 
     auto surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
 

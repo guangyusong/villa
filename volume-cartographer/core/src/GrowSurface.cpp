@@ -1278,6 +1278,11 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     std::cout << "  dist_loss_3d_w: " << dist_loss_3d_w << std::endl;
     std::cout << "  deterministic_seed: " << deterministic_seed << std::endl;
     std::cout << "  deterministic_jitter_px: " << deterministic_jitter_px << std::endl;
+    // Spike guard: reject commits that jump too far from neighbors
+    double neighbor_jump_factor = params.value("neighbor_jump_factor", 6.0);
+    double expected_spacing = src_step * step * voxelsize;
+    double neighbor_jump_limit = neighbor_jump_factor * expected_spacing;
+    std::cout << "  neighbor_jump_factor: " << neighbor_jump_factor << " (limit = " << neighbor_jump_limit << ")" << std::endl;
     std::cout << "  pointto_iterations: " << pointto_iterations << std::endl;
     std::cout << "  pointto_iterations_grid: " << pointto_iterations_grid << std::endl;
     if (enforce_z_range)
@@ -1658,6 +1663,32 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                     state(p) = 0;
                     points(p) = {-1,-1,-1};
                     continue;
+                }
+
+                // Pre-commit spike guard: ensure new point is close to existing neighbors
+                int n_valid = 0;
+                double sum_d = 0.0;
+                double max_d = 0.0;
+                const cv::Vec2i nbs8[8] = {{-1,-1},{-1,0},{-1,1},{0,-1},{0,1},{1,-1},{1,0},{1,1}};
+                for (auto nb : nbs8) {
+                    cv::Vec2i q = p + nb;
+                    if (q[0] < 0 || q[1] < 0 || q[0] >= h || q[1] >= w) continue;
+                    if ((state(q) & STATE_COORD_VALID) == 0) continue;
+                    const cv::Vec3d& pq = points(q);
+                    if (pq[0] == -1) continue;
+                    double d = cv::norm(best_coord - pq);
+                    sum_d += d;
+                    if (d > max_d) max_d = d;
+                    n_valid++;
+                }
+                if (n_valid >= 2) {
+                    double avg_d = sum_d / n_valid;
+                    if (avg_d > neighbor_jump_limit) {
+                        // Reject this candidate as a likely spike
+                        state(p) = 0;
+                        points(p) = {-1,-1,-1};
+                        continue;
+                    }
                 }
 
                 data_th.surfs(p).insert(best_surf);

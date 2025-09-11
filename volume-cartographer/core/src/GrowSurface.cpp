@@ -1940,6 +1940,8 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 }
             }
             pending_assimilations.clear();
+            // Ensure HR crop covers newly-added approved region
+            used_area_hr = {used_area.x*step, used_area.y*step, used_area.width*step, used_area.height*step};
             approved_pause.store(0, std::memory_order_relaxed);
         }
 

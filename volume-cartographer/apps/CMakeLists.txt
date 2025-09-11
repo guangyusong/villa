@@ -94,6 +94,13 @@ add_executable(vc_visualize src/vc_visualize.cpp)
 target_link_libraries(vc_visualize vc_core Boost::program_options)
 
 
+add_executable(vc_benchmark_pointto src/vc_benchmark_pointto.cpp)
+target_link_libraries(vc_benchmark_pointto
+    vc_core
+    Boost::program_options
+    opencv_core
+)
+
 add_executable(vc_ced2d src/vc_ced2d.cpp)
 target_link_libraries(vc_ced2d
     z5
@@ -160,6 +167,7 @@ install(
         vc_transform_geom
         vc_gen_normalgrids
         vc_telea_inpaint
+        vc_benchmark_pointto
         ${extra_apps}
     RUNTIME DESTINATION bin
     COMPONENT Programs

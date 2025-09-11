@@ -124,3 +124,10 @@ This fork contains the following changes compared to upstream currently:
 - Ensure app ends slice preloading threads and exits properly
 - Correctly clear the "Display All" and "Compute All" checkboxes when closing a volume, so they are in the correct initial state when a new volume gets opened
 - Fixed some crashes I came across
+
+## Benchmarking `pointTo`
+- Tool: `vc_benchmark_pointto`
+- Purpose: measure speed and accuracy of `QuadSurface::pointTo` across a directory of tifxyz surfaces (each a folder containing `x.tif`, `y.tif`, `z.tif`).
+- Usage:
+  - `vc_benchmark_pointto --root <dir> [--samples 2000] [--noise 0.0] [--threshold 2.0] [--iters 100] [--init center|random] [--recursive] [--seed 0]`
+  - Reports per-surface and aggregate averages: time per call (ms), residual (returned by `pointTo`), and mapping error (`||coord(ptr_out) - target||`).

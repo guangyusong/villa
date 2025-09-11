@@ -17,6 +17,8 @@
 
 #include <fstream>
 #include <iostream>
+#include <deque>
+#include <atomic>
 
 int static dbg_counter = 0;
 // Default values for thresholds Will be configurable through JSON
@@ -147,6 +149,8 @@ struct SurfPoint_hash {
     }
 };
 
+// (moved below SurfTrackerData definition)
+
 //Surface tracking data for loss functions
 class SurfTrackerData
 {
@@ -267,6 +271,81 @@ public:
     cv::Vec3d seed_coord;
     cv::Vec2i seed_loc;
 };
+
+// Forcefully map an approved surface across the grid, starting from a seed cell.
+// Ensures connectivity in the coarse grid and presence in HR upsample by:
+//  - stamping the surface membership (data.surfs / data.loc) on a connected set,
+//  - marking cells as valid in state,
+//  - initializing points(j,i) from the approved surface where empty.
+static void assimilate_approved_surface(
+    SurfaceMeta* sm,
+    const cv::Vec2i& start_p,
+    const cv::Vec2d& start_loc,
+    SurfTrackerData& data,
+    cv::Mat_<uint8_t>& state,
+    cv::Mat_<cv::Vec3d>& points,
+    cv::Rect& used_area,
+    float step, float /*src_step*/,
+    std::vector<cv::Vec2i>* changed /*= nullptr*/)
+{
+    const auto& rp = sm->surface()->rawPoints();
+    if (!loc_valid(rp, start_loc))
+        return;
+
+    // BFS over the coarse grid tied to 1px steps in the approved surface param space.
+    cv::Mat_<uint8_t> visited(state.size(), 0);
+    std::deque<std::pair<cv::Vec2i, cv::Vec2d>> q;
+
+    auto push = [&](const cv::Vec2i& p, const cv::Vec2d& l){
+        if (p[0] <= 0 || p[1] <= 0 || p[0] >= state.rows-1 || p[1] >= state.cols-1)
+            return;
+        if (visited(p))
+            return;
+        if (!loc_valid(rp, l))
+            return;
+        visited(p) = 1;
+        q.emplace_back(p, l);
+    };
+
+    // seed
+    push(start_p, start_loc);
+
+    const cv::Vec2i neighs[4] = {{1,0},{-1,0},{0,1},{0,-1}};
+
+    // Rough guard to avoid pathological expansion
+    size_t max_added = size_t(rp.rows) * size_t(rp.cols) * 4ull;
+    size_t added = 0;
+
+    while(!q.empty() && added < max_added) {
+        auto [p, l] = q.front(); q.pop_front();
+
+        // Stamp mapping and initialize cell
+        data.surfs(p).insert(sm);
+        data.loc(sm, p) = l;
+
+        if (!(state(p) & (STATE_LOC_VALID | STATE_COORD_VALID))) {
+            cv::Vec3d c = SurfTrackerData::lookup_int_loc(sm, cv::Vec2f(l));
+            if (c[0] != -1) {
+                points(p) = c;
+                state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
+            }
+        }
+
+        used_area = used_area | cv::Rect(p[1], p[0], 1, 1);
+        if (changed)
+            changed->push_back(p);
+
+        // Expand 4-neighborhood in grid with 1px steps in surface param space
+        for (auto off : neighs) {
+            cv::Vec2i pn = p + off;
+            // Move by 'step' in surface param space for each coarse grid neighbor
+            cv::Vec2d ln = l + cv::Vec2d(off[0]*step, off[1]*step); // l is [y, x]
+            push(pn, ln);
+        }
+
+        ++added;
+    }
+}
 
 static void copy(const SurfTrackerData &src, SurfTrackerData &tgt, const cv::Rect &roi_)
 {
@@ -769,7 +848,9 @@ static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat
 //this is basically just a reparametrization
 static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points, cv::Rect used_area,
     cv::Rect static_bounds, float step, float src_step, const cv::Vec2i &seed, int closing_r, bool keep_inpainted = false,
-    const std::filesystem::path& tgt_dir = std::filesystem::path())
+    int pointto_iterations = 10,
+    const std::filesystem::path& tgt_dir = std::filesystem::path(),
+    const std::set<SurfaceMeta*>& approved_sm = std::set<SurfaceMeta*>())
 {
     std::cout << "optimizer: optimizing surface " << state.size() << " " << used_area <<  " " << static_bounds << std::endl;
 
@@ -978,7 +1059,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
 
                     for(auto &s : surfs) {
                         auto ptr = s->surface()->pointer();
-                        float res = s->surface()->pointTo(ptr, points_out(j, i), same_surface_th, 10);
+                        float res = s->surface()->pointTo(ptr, points_out(j, i), same_surface_th, pointto_iterations);
                         if (res <= same_surface_th) {
                             mutex.lock();
                             data_out.surfs({j,i}).insert(s);
@@ -998,6 +1079,9 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                 for (auto s : surf_src) {
                     int count;
                     float cost = local_cost(s, {j,i}, data_out, state_out, points_out, step, src_step, &count);
+                    // Never drop approved surfaces during optimization filtering
+                    if (approved_sm.contains(s))
+                        continue;
                     if (cost >= local_cost_inl_th /*|| count < 1*/) {
                         data_out.erase(s, {j,i});
                         data_out.eraseSurf(s, {j,i});
@@ -1034,7 +1118,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                         mutex.unlock_shared();
 
                         auto ptr = test_surf->surface()->pointer();
-                        if (test_surf->surface()->pointTo(ptr, points_out(j, i), same_surface_th, 10) > same_surface_th)
+                        if (test_surf->surface()->pointTo(ptr, points_out(j, i), same_surface_th, pointto_iterations) > same_surface_th)
                             continue;
 
                         int count = 0;
@@ -1117,6 +1201,12 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     float step = params.value("step", 10);
     int max_width = params.value("max_width", 80000);
 
+    // Configurable iteration counts for pointTo calls
+    // - pointto_iterations: used for surface->pointTo calls (default 10)
+    // - pointto_iterations_grid: used for grid pointTo() against dense point maps (default 1000)
+    int pointto_iterations = params.value("pointto_iterations", 10);
+    int pointto_iterations_grid = params.value("pointto_iterations_grid", 1000);
+
     local_cost_inl_th = params.value("local_cost_inl_th", 0.2f);
     same_surface_th = params.value("same_surface_th", 2.0f);
     straight_weight = params.value("straight_weight", 0.7f);            // Weight for 2D straight line constraints
@@ -1170,6 +1260,8 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     std::cout << "  dist_loss_3d_w: " << dist_loss_3d_w << std::endl;
     std::cout << "  deterministic_seed: " << deterministic_seed << std::endl;
     std::cout << "  deterministic_jitter_px: " << deterministic_jitter_px << std::endl;
+    std::cout << "  pointto_iterations: " << pointto_iterations << std::endl;
+    std::cout << "  pointto_iterations_grid: " << pointto_iterations_grid << std::endl;
     if (enforce_z_range)
         std::cout << "  z_range: [" << z_min << ", " << z_max << "]" << std::endl;
 
@@ -1196,6 +1288,10 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
         for(const auto& name : sm->overlapping_str)
             if (surfs.contains(name))
                 sm->overlapping.insert(surfs[name]);
+
+    // Track which approved surfaces we have fully assimilated and requests pending for assimilation
+    std::set<SurfaceMeta*> assimilated_approved;
+    std::vector<std::tuple<SurfaceMeta*, cv::Vec2i, cv::Vec2d>> pending_assimilations;
 
     std::cout << "total surface count (after defective filter): " << surfs.size() << std::endl;
     std::cout << "seed " << seed << " name " << seed->name() << " seed overlapping: "
@@ -1276,7 +1372,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
         std::cout << "testing " << p << " from cands: " << seed->overlapping.size() << coord << std::endl;
         for(auto s : seed->overlapping) {
             auto ptr = s->surface()->pointer();
-            if (s->surface()->pointTo(ptr, coord, same_surface_th) <= same_surface_th) {
+            if (s->surface()->pointTo(ptr, coord, same_surface_th, pointto_iterations) <= same_surface_th) {
                 cv::Vec3f loc = s->surface()->loc_raw(ptr);
                 data.surfs(p).insert(s);
                 data.loc(s, p) = {loc[1], loc[0]};
@@ -1338,12 +1434,17 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
         std::vector<cv::Vec2i> cands_vec(cands.begin(), cands.end());
 
         std::shared_mutex mutex;
+        std::atomic<int> approved_pause{0};
         int best_inliers_gen = 0;
 #pragma omp parallel for schedule(static)
         for (int idx = 0; idx < static_cast<int>(cands_vec.size()); ++idx)
         {
             int r = 1;
             cv::Vec2i p = cands_vec[idx];
+
+            // If an approved patch was triggered this generation, pause other additions
+            if (approved_pause.load(std::memory_order_relaxed))
+                continue;
 
             if (state(p) & STATE_LOC_VALID)
                 continue;
@@ -1476,7 +1577,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 for(auto test_surf : local_surfs) {
                     auto ptr = test_surf->surface()->pointer();
                     //FIXME this does not check geometry, only if its also on the surfaces (which might be good enough...)
-                    if (test_surf->surface()->pointTo(ptr, coord, same_surface_th, 10) <= same_surface_th) {
+                    if (test_surf->surface()->pointTo(ptr, coord, same_surface_th, pointto_iterations) <= same_surface_th) {
                         int count = 0;
                         int straight_count = 0;
                         state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
@@ -1518,7 +1619,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 } else {
                 cv::Vec2f tmp_loc_;
                 cv::Rect used_th = used_area;
-                float dist = pointTo(tmp_loc_, points(used_th), best_coord, same_surface_th, 1000, 1.0/(step*src_step));
+                float dist = pointTo(tmp_loc_, points(used_th), best_coord, same_surface_th, pointto_iterations_grid, 1.0/(step*src_step));
                 tmp_loc_ += cv::Vec2f(used_th.x,used_th.y);
                 if (dist <= same_surface_th) {
                     int state_sum = state(tmp_loc_[1],tmp_loc_[0]) + state(tmp_loc_[1]+1,tmp_loc_[0]) + state(tmp_loc_[1],tmp_loc_[0]+1) + state(tmp_loc_[1]+1,tmp_loc_[0]+1);
@@ -1533,6 +1634,13 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
             if (best_inliers >= curr_best_inl_th || best_ref_seed) {
                 if (best_coord[0] == -1)
                     throw std::runtime_error("oops best_cord[0]");
+
+                // If an approved patch has been triggered by another thread, skip non-approved commits
+                if (approved_pause.load(std::memory_order_relaxed) && !best_approved) {
+                    state(p) = 0;
+                    points(p) = {-1,-1,-1};
+                    continue;
+                }
 
                 data_th.surfs(p).insert(best_surf);
                 data_th.loc(best_surf, p) = best_loc;
@@ -1554,7 +1662,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                         continue;
 
                     auto ptr = test_surf->surface()->pointer();
-                    if (test_surf->surface()->pointTo(ptr, best_coord, same_surface_th, 10) <= same_surface_th) {
+                    if (test_surf->surface()->pointTo(ptr, best_coord, same_surface_th, pointto_iterations) <= same_surface_th) {
                         cv::Vec3f loc = test_surf->surface()->loc_raw(ptr);
                         data_th.loc(test_surf, p) = {loc[1], loc[0]};
                         int count = 0;
@@ -1576,7 +1684,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 //TODO only add/test if we have 2 neighs which both find locations
                 for(auto test_surf : more_local_surfs) {
                     auto ptr = test_surf->surface()->pointer();
-                    float res = test_surf->surface()->pointTo(ptr, best_coord, same_surface_th, 10);
+                    float res = test_surf->surface()->pointTo(ptr, best_coord, same_surface_th, pointto_iterations);
                     if (res <= same_surface_th) {
                         cv::Vec3f loc = test_surf->surface()->loc_raw(ptr);
                         cv::Vec3f coord = SurfTrackerData::lookup_int_loc(test_surf, {loc[1], loc[0]});
@@ -1600,8 +1708,16 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                     if (data_th.has(s, p))
                         data.loc(s, p) = data_th.loc(s, p);
 
+                // Always share this accepted point with all threads
                 for(int t=0;t<omp_get_max_threads();t++)
                     added_points_threads[t].push_back(p);
+
+                // If this was an approved surface, signal pause and schedule assimilation after the parallel phase.
+                if (best_approved && !assimilated_approved.contains(best_surf)) {
+                    approved_pause.store(1, std::memory_order_relaxed);
+                    pending_assimilations.emplace_back(best_surf, p, best_loc);
+                    assimilated_approved.insert(best_surf);
+                }
 
                 if (!used_area.contains(cv::Point(p[1],p[0]))) {
                     used_area = used_area | cv::Rect(p[1],p[0],1,1);
@@ -1719,7 +1835,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
             cv::Mat_<cv::Vec3d> opt_points = points.clone();
 
             cv::Rect active = active_bounds & used_area;
-            optimize_surface_mapping(opt_data, opt_state, opt_points, active, static_bounds, step, src_step, {y0,x0}, closing_r, true, tgt_dir);
+            optimize_surface_mapping(opt_data, opt_state, opt_points, active, static_bounds, step, src_step, {y0,x0}, closing_r, true, pointto_iterations, tgt_dir, approved_sm);
             if (active.area() > 0) {
                 copy(opt_data, data, active);
                 opt_points(active).copyTo(points(active));
@@ -1755,6 +1871,76 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 dbg_surf->save(tgt_dir / uuid, uuid);
                 delete dbg_surf;
             }
+        }
+
+        // Perform any pending approved-surface assimilations now (single-threaded, safe).
+        if (!pending_assimilations.empty()) {
+            // 1) Ensure width is large enough to host the full approved patch span to the right
+            int required_w = w;
+            for (auto &req : pending_assimilations) {
+                SurfaceMeta* sm; cv::Vec2i p; cv::Vec2d l; std::tie(sm, p, l) = req;
+                const auto &rp = sm->surface()->rawPoints();
+                int li_x = std::max(0, std::min(int(std::floor(l[1])), rp.cols - 2));
+                int right_room = (rp.cols - 2) - li_x; // how far we can go to the right in surface space
+                int target_px_max = p[1] + right_room + 2; // +2 to allow interpolation neighborhood
+                required_w = std::max(required_w, target_px_max + 1);
+            }
+
+            int max_w_allowed = max_width/step; // respect overall cap
+            if (required_w > max_w_allowed)
+                required_w = max_w_allowed;
+
+            if (required_w > w) {
+                int old_w = w;
+                int delta_w = required_w - old_w;
+
+                std::cout << "auto-expanding window for approved patch by " << delta_w << " (" << old_w << " -> " << required_w << ")" << std::endl;
+
+                w = required_w;
+                size = {w,h};
+                bounds = {0,0,w-1,h-1};
+                save_bounds_inv = {closing_r+5,closing_r+5,h-closing_r-10,w-closing_r-10};
+
+                cv::Mat_<cv::Vec3d> old_points = points;
+                points = cv::Mat_<cv::Vec3d>(size, {-1,-1,-1});
+                old_points.copyTo(points(cv::Rect(0,0,old_points.cols,h)));
+
+                cv::Mat_<uint8_t> old_state = state;
+                state = cv::Mat_<uint8_t>(size, 0);
+                old_state.copyTo(state(cv::Rect(0,0,old_state.cols,h)));
+
+                cv::Mat_<uint16_t> old_inliers_sum_dbg = inliers_sum_dbg;
+                inliers_sum_dbg = cv::Mat_<uint16_t>(size, 0);
+                old_inliers_sum_dbg.copyTo(inliers_sum_dbg(cv::Rect(0,0,old_inliers_sum_dbg.cols,h)));
+
+                // Update active/static bounds based on the expansion size (delta_w)
+                int overlap = 5;
+                active_bounds = {w-delta_w-2*closing_r-10-overlap,closing_r+5,delta_w+2*closing_r+10+overlap,h-closing_r-10};
+                static_bounds = {0,0,w-delta_w-2*closing_r-10,h};
+
+                // Refresh fringe within the new active area for safety
+                cv::Rect active = active_bounds & used_area;
+                fringe.clear();
+                curr_best_inl_th = inlier_base_threshold;
+                for(int j=active.y-2;j<=active.br().y+2;j++)
+                    for(int i=active.x-2;i<=active.br().x+2;i++)
+                        if (state(j,i) & STATE_LOC_VALID)
+                            fringe.insert(cv::Vec2i(j,i));
+            }
+
+            // 2) Assimilate approved patches now that size is sufficient
+            for (auto &req : pending_assimilations) {
+                SurfaceMeta* sm; cv::Vec2i p; cv::Vec2d l; std::tie(sm, p, l) = req;
+                std::vector<cv::Vec2i> changed_cells;
+                assimilate_approved_surface(sm, p, l, data, state, points, used_area, step, src_step, &changed_cells);
+                for (const auto& cp : changed_cells) {
+                    fringe.insert(cp);
+                    for(int t=0;t<omp_get_max_threads();t++)
+                        added_points_threads[t].push_back(cp);
+                }
+            }
+            pending_assimilations.clear();
+            approved_pause.store(0, std::memory_order_relaxed);
         }
 
         float const current_area_vx2 = loc_valid_count*src_step*src_step*step*step;

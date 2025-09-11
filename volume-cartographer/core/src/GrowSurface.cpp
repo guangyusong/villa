@@ -80,6 +80,27 @@ struct Vec2iLess {
     }
 };
 
+// Simple 3D anchor loss used by seam relaxation
+struct L2Anchor3 {
+    cv::Vec3d target; double w;
+    template <typename T>
+    bool operator()(const T* const x, T* residual) const {
+        residual[0] = T(w) * (x[0] - T(target[0]));
+        residual[1] = T(w) * (x[1] - T(target[1]));
+        residual[2] = T(w) * (x[2] - T(target[2]));
+        return true;
+    }
+    static ceres::CostFunction* Create(const cv::Vec3d& t, double w) {
+        return new ceres::AutoDiffCostFunction<L2Anchor3,3,3>(new L2Anchor3{t,w});
+    }
+};
+
+// Forward declarations for seam stitching helpers
+static int add_surftrack_distloss_3D(cv::Mat_<cv::Vec3d> &points, const cv::Vec2i &p, const cv::Vec2i &off, ceres::Problem &problem,
+    const cv::Mat_<uint8_t> &state, float unit, int flags, ceres::ResidualBlockId *res, float w);
+static int add_surftrack_straightloss_3D(const cv::Vec2i &p, const cv::Vec2i &o1, const cv::Vec2i &o2, const cv::Vec2i &o3, cv::Mat_<cv::Vec3d> &points,
+    ceres::Problem &problem, const cv::Mat_<uint8_t> &state, int flags, ceres::ResidualBlockId *res, float w);
+
 class resId_t
 {
 public:
@@ -345,6 +366,105 @@ static void assimilate_approved_surface(
 
         ++added;
     }
+}
+
+// After stamping an approved patch, relax a small ring around the seam so
+// neighboring quads attach smoothly without warps. Approved cells remain fixed.
+// Robust seam relaxation using local Ceres solve on a thin ring around approved region
+// Keeps approved and non-seam cells fixed; adjusts just the ring to attach smoothly.
+static void relax_seam_band(
+    SurfTrackerData& data,
+    cv::Mat_<uint8_t>& state,
+    cv::Mat_<cv::Vec3d>& points,
+    const std::set<SurfaceMeta*>& approved_sm,
+    const cv::Rect& used_area,
+    float step,
+    float src_step,
+    int ring = 2,
+    double anchor_w = 0.05)
+{
+    if (approved_sm.empty()) return;
+
+    auto is_approved_cell = [&](const cv::Vec2i& p)->bool{
+        const auto& ss = data.surfsC(p);
+        for (auto s : ss) if (approved_sm.contains(s)) return true;
+        return false;
+    };
+
+    // seam mask (ring around approved region)
+    cv::Mat_<uint8_t> seam(points.size(), uint8_t(0));
+    for (int j = used_area.y; j < used_area.br().y; ++j)
+        for (int i = used_area.x; i < used_area.br().x; ++i) {
+            cv::Vec2i p{j,i};
+            if (!(state(p) & (STATE_COORD_VALID | STATE_LOC_VALID))) continue;
+            if (is_approved_cell(p)) continue;
+            bool near = false;
+            for (int dy = -ring; dy <= ring && !near; ++dy)
+                for (int dx = -ring; dx <= ring && !near; ++dx) {
+                    cv::Vec2i q{j+dy, i+dx};
+                    if (q[0] < used_area.y || q[1] < used_area.x || q[0] >= used_area.br().y || q[1] >= used_area.br().x) continue;
+                    if (!(state(q) & (STATE_COORD_VALID | STATE_LOC_VALID))) continue;
+                    if (is_approved_cell(q)) near = true;
+                }
+            if (near) seam(j,i) = 255;
+        }
+
+    // local Ceres solve on seam ring with 3D dist + straightness + small anchor to original positions
+
+    ceres::Problem prob;
+    float unit = step * src_step;
+
+    auto add_dist = [&](const cv::Vec2i& p, const cv::Vec2i& off){
+        cv::Vec2i q = p + off;
+        if (q[0] < used_area.y || q[1] < used_area.x || q[0] >= used_area.br().y || q[1] >= used_area.br().x) return;
+        if (!(state(q) & (STATE_COORD_VALID | STATE_LOC_VALID))) return;
+        prob.AddResidualBlock(DistLoss::Create(unit * cv::norm(off), dist_loss_3d_w), nullptr, &points(p)[0], &points(q)[0]);
+    };
+    auto add_straight = [&](const cv::Vec2i& p, const cv::Vec2i& o1, const cv::Vec2i& o2, const cv::Vec2i& o3){
+        cv::Vec2i a = p + o1, b = p + o2, c = p + o3;
+        auto inside = [&](const cv::Vec2i& r){ return r[0] >= used_area.y && r[1] >= used_area.x && r[0] < used_area.br().y && r[1] < used_area.br().x; };
+        if (!inside(a) || !inside(b) || !inside(c)) return;
+        if (!(state(a) & (STATE_COORD_VALID | STATE_LOC_VALID))) return;
+        if (!(state(b) & (STATE_COORD_VALID | STATE_LOC_VALID))) return;
+        if (!(state(c) & (STATE_COORD_VALID | STATE_LOC_VALID))) return;
+        prob.AddResidualBlock(StraightLoss::Create(straight_weight_3D), nullptr, &points(a)[0], &points(b)[0], &points(c)[0]);
+    };
+
+    // Add residuals for seam cells only; neighbors may be outside seam (they will be fixed)
+    for (int j = used_area.y; j < used_area.br().y; ++j)
+        for (int i = used_area.x; i < used_area.br().x; ++i) {
+            if (!seam(j,i)) continue;
+            cv::Vec2i p{j,i};
+            // distance to 8-neighborhood
+            add_dist(p, {0,1}); add_dist(p, {1,0}); add_dist(p, {0,-1}); add_dist(p, {-1,0});
+            add_dist(p, {1,1}); add_dist(p, {1,-1}); add_dist(p, {-1,1}); add_dist(p, {-1,-1});
+            // straightness
+            add_straight(p, {0,-2},{0,-1},{0,0});
+            add_straight(p, {0,-1},{0,0},{0,1});
+            add_straight(p, {0,0},{0,1},{0,2});
+            add_straight(p, {-2,0},{-1,0},{0,0});
+            add_straight(p, {-1,0},{0,0},{1,0});
+            add_straight(p, {0,0},{1,0},{2,0});
+            // small anchor to original
+            prob.AddResidualBlock(L2Anchor3::Create(points(j,i), anchor_w), nullptr, &points(j,i)[0]);
+        }
+
+    // Freeze all non-seam cells (includes approved region)
+    for (int j = used_area.y; j < used_area.br().y; ++j)
+        for (int i = used_area.x; i < used_area.br().x; ++i) {
+            if (seam(j,i)) continue;
+            if (state(j,i) & (STATE_COORD_VALID | STATE_LOC_VALID))
+                if (prob.HasParameterBlock(&points(j,i)[0]))
+                    prob.SetParameterBlockConstant(&points(j,i)[0]);
+        }
+
+    if (prob.NumResidualBlocks() == 0) return;
+    ceres::Solver::Options opts;
+    opts.linear_solver_type = ceres::SPARSE_SCHUR;
+    opts.max_num_iterations = 100;
+    opts.num_threads = omp_get_max_threads();
+    ceres::Solver::Summary sum;
+    ceres::Solve(opts, &prob, &sum);
 }
 
 static void copy(const SurfTrackerData &src, SurfTrackerData &tgt, const cv::Rect &roi_)
@@ -1926,6 +2046,9 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
             pending_assimilations.clear();
             // Ensure HR crop covers newly-added approved region
             used_area_hr = {used_area.x*step, used_area.y*step, used_area.width*step, used_area.height*step};
+
+            // 3) Immediately relax a small seam ring so attachment is smooth (localized Ceres solve)
+            relax_seam_band(data, state, points, approved_sm, used_area, step, src_step, /*ring=*/2, /*anchor_w=*/0.05);
             approved_pause.store(0, std::memory_order_relaxed);
         }
 

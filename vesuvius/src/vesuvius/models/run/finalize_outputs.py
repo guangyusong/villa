@@ -55,16 +55,6 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
     input_slice = (slice(None),) + spatial_slices 
     logits_np = input_store[input_slice]
     
-    # Check if this is an empty chunk (all values are the same, indicating no meaningful data)
-    # This handles empty patches that have been filled with any constant value
-    first_value = logits_np.flat[0]  # Get the first value
-    is_empty = np.allclose(logits_np, first_value, rtol=1e-6)
-    
-    if is_empty:
-        # For empty/homogeneous patches, don't write anything to the output store
-        # This ensures write_empty_chunks=False works correctly
-        return {'chunk_idx': chunk_idx, 'processed_voxels': 0, 'empty': True}
-    
     if mode == "binary":
         if is_multi_task and target_info:
             # For multi-task binary, process each target separately
@@ -101,10 +91,9 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
             softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
             
             if threshold:
-                # Create binary mask using argmax (class 1 is foreground)
-                # Simply check if foreground probability > background probability
-                binary_mask = (softmax[1] > softmax[0]).astype(np.float32)
-                output_data = binary_mask[np.newaxis, ...]  # Add channel dim
+                # Create binary mask using argmax (class 1 is foreground) -> keep as 0/1 labels
+                binary_mask = (softmax[1] > softmax[0]).astype(np.uint8)
+                output_data = binary_mask[np.newaxis, ...]  # (1, Z, Y, X)
             else:
                 # Extract foreground probability (channel 1)
                 fg_prob = softmax[1:2]  
@@ -116,34 +105,36 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
         softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
         
         # Compute argmax
-        argmax = np.argmax(logits_np, axis=0).astype(np.float32)
-        argmax = argmax[np.newaxis, ...]  # Add channel dim
+        argmax = np.argmax(logits_np, axis=0).astype(np.uint8)
+        argmax = argmax[np.newaxis, ...]  # (1, Z, Y, X)
         
         if threshold: 
-            # If threshold is provided for multiclass, only save the argmax
-            output_data = argmax
+            # If threshold is provided for multiclass, only save the argmax labels (0..C-1)
+            output_data = argmax.astype(np.uint8)
         else:
-            # Concatenate softmax and argmax
-            output_data = np.concatenate([softmax, argmax], axis=0)
+            # Concatenate softmax and argmax; treat channels differently when writing
+            output_data = np.concatenate([softmax, argmax.astype(np.float32)], axis=0)
     
-    # output_data is already numpy
-    output_np = output_data
-    
-    # Scale to uint8 range [0, 255]
-    min_val = output_np.min()
-    max_val = output_np.max()
-    if min_val < max_val: 
-        output_np = ((output_np - min_val) / (max_val - min_val) * 255).astype(np.uint8)
-    else:
-        # All values are the same after processing - this is effectively an empty chunk
-        # Don't write anything to respect write_empty_chunks=False
-        return {'chunk_idx': chunk_idx, 'processed_voxels': 0, 'empty': True}
-    
-    # Final check: if the processed data is homogeneous, don't write it
-    first_processed_value = output_np.flat[0]
-    if np.all(output_np == first_processed_value):
-        # Processed chunk is homogeneous (e.g., all 0s or all 255s), skip writing
-        return {'chunk_idx': chunk_idx, 'processed_voxels': 0, 'empty': True}
+    # Convert to uint8 per mode/flag without per-chunk min-max scaling
+    if mode == "binary":
+        if threshold:
+            # output_data is (1, Z, Y, X) with labels {0,1}; map to {0,255}
+            output_np = (output_data * 255).astype(np.uint8)
+        else:
+            # Softmax foreground probability in [0,1] -> [0,255]
+            output_np = np.clip(output_data, 0.0, 1.0)
+            output_np = (output_np * 255.0).astype(np.uint8)
+    else:  # multiclass
+        if threshold:
+            # Argmax labels 0..C-1 as uint8
+            output_np = output_data.astype(np.uint8)
+        else:
+            # First num_classes channels are softmax in [0,1]; last channel is argmax labels
+            num_soft = num_classes
+            soft = np.clip(output_data[:num_soft], 0.0, 1.0)
+            soft_u8 = (soft * 255.0).astype(np.uint8)
+            argmax_u8 = output_data[num_soft:].astype(np.uint8)
+            output_np = np.concatenate([soft_u8, argmax_u8], axis=0)
 
     if squeeze_single_channel:
         output_store[spatial_slices] = output_np[0]

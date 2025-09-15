@@ -376,7 +376,17 @@ def finalize_logits(
             lvl0 = open_zarr(os.path.join(root_path, '0'), mode='r', storage_options={'anon': False} if root_path.startswith('s3://') else None)
             lvl0_shape = lvl0.shape
             has_channel = (len(lvl0_shape) == 4)
-            datasets = [{'path': '0'}]
+            # Dataset entries with coordinateTransformations (NGFF v0.4)
+            if has_channel:
+                scale0 = [1.0, 1.0, 1.0, 1.0]
+            else:
+                scale0 = [1.0, 1.0, 1.0]
+            datasets = [{
+                'path': '0',
+                'coordinateTransformations': [
+                    {'type': 'scale', 'scale': scale0}
+                ]
+            }]
 
             prev_path = os.path.join(root_path, '0')
             prev_shape = lvl0_shape
@@ -459,7 +469,17 @@ def finalize_logits(
                                 block_ds = prev_block.reshape(Zb//2, 2, Yb//2, 2, Xb//2, 2).mean(axis=(1, 3, 5))
                                 ds_store[(slice(oz, oz1), slice(oy, oy1), slice(ox, ox1))] = block_ds
 
-                datasets.append({'path': str(i)})
+                # Add dataset entry with scale transform for this level
+                if has_channel:
+                    scale_i = [1.0, float(2 ** i), float(2 ** i), float(2 ** i)]
+                else:
+                    scale_i = [float(2 ** i), float(2 ** i), float(2 ** i)]
+                datasets.append({
+                    'path': str(i),
+                    'coordinateTransformations': [
+                        {'type': 'scale', 'scale': scale_i}
+                    ]
+                })
                 prev_path = lvl_path
                 prev_shape = next_shape
 
@@ -470,9 +490,9 @@ def finalize_logits(
                 if has_channel:
                     axes.append({'name': 'c', 'type': 'channel'})
                 axes.extend([
-                    {'name': 'z', 'type': 'space'},
-                    {'name': 'y', 'type': 'space'},
-                    {'name': 'x', 'type': 'space'}
+                    {'name': 'z', 'type': 'space', 'unit': 'pixel'},
+                    {'name': 'y', 'type': 'space', 'unit': 'pixel'},
+                    {'name': 'x', 'type': 'space', 'unit': 'pixel'}
                 ])
                 root.attrs['multiscales'] = [{
                     'version': '0.4',

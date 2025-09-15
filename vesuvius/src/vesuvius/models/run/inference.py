@@ -822,7 +822,7 @@ class Inferer():
                     if non_empty_indices:
                         non_empty_input = input_batch[non_empty_indices]
                         
-                        with torch.no_grad(), torch.amp.autocast('cuda'):
+                        with torch.no_grad(), torch.autocast(device_type=self.device.type):
                             if self.do_tta:
                                 non_empty_output = infer_with_tta(
                                     self.model,
@@ -965,7 +965,7 @@ class Inferer():
                 patch = np.zeros((pY, pX), dtype=np.float32)
                 patch[:sub.shape[0], :sub.shape[1]] = sub
                 t = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).to(self.device)
-                with torch.no_grad(), torch.amp.autocast('cuda'):
+                with torch.no_grad(), torch.autocast(device_type=self.device.type):
                     if self.do_tta:
                         logits = infer_with_tta(
                             self.model, t, self.tta_type,
@@ -1000,11 +1000,16 @@ class Inferer():
                 tifffile.imwrite(str(out_path), out_arr, compression='zlib')
                 return str(out_path)
 
-            # Regular blending path
-            g = generate_gaussian_map((1, pY, pX), sigma_scale=8.0, dtype=np.float32)[0]
-            gaussian_map_2d = g[0]
-            logits_acc = np.zeros((self.num_classes, Y, X), dtype=np.float32)
-            weights_acc = np.zeros((Y, X), dtype=np.float32)
+            # Regular blending path (accumulate on device like nnU-Net)
+            g_np = generate_gaussian_map((1, pY, pX), sigma_scale=8.0, dtype=np.float32)[0][0]  # (pY, pX)
+            gaussian_map_2d = torch.from_numpy(g_np).to(self.device, dtype=torch.float16)
+            # ensure strictly positive weights to avoid division issues
+            if torch.any(gaussian_map_2d == 0):
+                min_nonzero = torch.min(gaussian_map_2d[gaussian_map_2d > 0])
+                gaussian_map_2d = torch.where(gaussian_map_2d == 0, min_nonzero, gaussian_map_2d)
+
+            logits_acc = torch.zeros((self.num_classes, Y, X), dtype=torch.float16, device=self.device)
+            weights_acc = torch.zeros((Y, X), dtype=torch.float16, device=self.device)
             coords = self._compute_patch_positions((Y, X))
         else:
             # Promote 2D to 3D with Z=1
@@ -1018,7 +1023,7 @@ class Inferer():
                 patch = np.zeros((pZ, pY, pX), dtype=np.float32)
                 patch[:sub.shape[0], :sub.shape[1], :sub.shape[2]] = sub
                 t = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).to(self.device)
-                with torch.no_grad(), torch.amp.autocast('cuda'):
+                with torch.no_grad(), torch.autocast(device_type=self.device.type):
                     if self.do_tta:
                         logits = infer_with_tta(
                             self.model, t, self.tta_type,
@@ -1059,10 +1064,15 @@ class Inferer():
                 tifffile.imwrite(str(out_path), out_arr, compression='zlib')
                 return str(out_path)
 
-            # Regular blending path
-            gaussian_map = generate_gaussian_map(self.patch_size, sigma_scale=8.0, dtype=np.float32)[0]  # (pZ,pY,pX)
-            logits_acc = np.zeros((self.num_classes, Z, Y, X), dtype=np.float32)
-            weights_acc = np.zeros((Z, Y, X), dtype=np.float32)
+            # Regular blending path (accumulate on device like nnU-Net)
+            g_np = generate_gaussian_map(self.patch_size, sigma_scale=8.0, dtype=np.float32)[0]  # (pZ,pY,pX)
+            gaussian_map = torch.from_numpy(g_np).to(self.device, dtype=torch.float16)
+            if torch.any(gaussian_map == 0):
+                min_nonzero = torch.min(gaussian_map[gaussian_map > 0])
+                gaussian_map = torch.where(gaussian_map == 0, min_nonzero, gaussian_map)
+
+            logits_acc = torch.zeros((self.num_classes, Z, Y, X), dtype=torch.float16, device=self.device)
+            weights_acc = torch.zeros((Z, Y, X), dtype=torch.float16, device=self.device)
             coords = self._compute_patch_positions((Z, Y, X))
 
         # Simple batching for speed
@@ -1072,7 +1082,7 @@ class Inferer():
 
         def run_batch(tensor_batch: torch.Tensor, coord_list: list):
             nonlocal logits_acc, weights_acc
-            with torch.no_grad(), torch.amp.autocast('cuda'):
+            with torch.no_grad(), torch.autocast(device_type=self.device.type):
                 if self.do_tta:
                     batch_logits = infer_with_tta(
                         self.model,
@@ -1086,29 +1096,28 @@ class Inferer():
                     if self.is_multi_task:
                         batch_logits = self._concat_multi_task_outputs(batch_logits)
 
-            # batch_logits: (B, C, pZ, pY, pX) for 3D, (B, C, pY, pX) for 2D
-            batch_logits_np = batch_logits.detach().float().cpu().numpy()
+            # batch_logits: (B, C, pZ, pY, pX) for 3D, (B, C, pY, pX) for 2D (on device)
             if self.is_2d_model:
                 for i, (y, x) in enumerate(coord_list):
-                    p = batch_logits_np[i]  # (C,pY,pX)
+                    p = batch_logits[i].to(dtype=torch.float16)  # (C,pY,pX) on device
                     iy0 = y; ix0 = x
                     iy1 = min(y + pY, Y); ix1 = min(x + pX, X)
                     py0 = max(0, - (y - 0)); px0 = max(0, - (x - 0))
                     py1 = py0 + (iy1 - iy0); px1 = px0 + (ix1 - ix0)
                     logits_slice = p[:, py0:py1, px0:px1]
                     w_slice = gaussian_map_2d[py0:py1, px0:px1]
-                    logits_acc[:, iy0:iy1, ix0:ix1] += logits_slice * w_slice[np.newaxis, ...]
+                    logits_acc[:, iy0:iy1, ix0:ix1] += logits_slice * w_slice.unsqueeze(0)
                     weights_acc[iy0:iy1, ix0:ix1] += w_slice
             else:
                 for i, (z, y, x) in enumerate(coord_list):
-                    p = batch_logits_np[i]  # (C,pZ,pY,pX)
+                    p = batch_logits[i].to(dtype=torch.float16)  # (C,pZ,pY,pX)
                     iz0 = z; iy0 = y; ix0 = x
                     iz1 = min(z + pZ, Z); iy1 = min(y + pY, Y); ix1 = min(x + pX, X)
                     pz0 = max(0, - (z - 0)); py0 = max(0, - (y - 0)); px0 = max(0, - (x - 0))
                     pz1 = pz0 + (iz1 - iz0); py1 = py0 + (iy1 - iy0); px1 = px0 + (ix1 - ix0)
                     logits_slice = p[:, pz0:pz1, py0:py1, px0:px1]
                     w_slice = gaussian_map[pz0:pz1, py0:py1, px0:px1]
-                    logits_acc[:, iz0:iz1, iy0:iy1, ix0:ix1] += logits_slice * w_slice[np.newaxis, ...]
+                    logits_acc[:, iz0:iz1, iy0:iy1, ix0:ix1] += logits_slice * w_slice.unsqueeze(0)
                     weights_acc[iz0:iz1, iy0:iy1, ix0:ix1] += w_slice
 
         # Iterate positions
@@ -1152,11 +1161,15 @@ class Inferer():
             run_batch(tensor_batch, batch_coords)
             batch_buf.clear(); batch_coords.clear()
 
-        # Normalize by weights (only when using blending)
+        # Normalize by weights (only when using blending) on device
         eps = 1e-8
-        nonzero = weights_acc > 0
-        for c in range(self.num_classes):
-            logits_acc[c, nonzero] = logits_acc[c, nonzero] / (weights_acc[nonzero] + eps)
+        # broadcast weights to channel dimension
+        if self.is_2d_model:
+            logits_acc = logits_acc / (weights_acc.clamp_min(eps).unsqueeze(0))
+            logits_acc_np = logits_acc.to(dtype=torch.float32).cpu().numpy()
+        else:
+            logits_acc = logits_acc / (weights_acc.clamp_min(eps).unsqueeze(0))
+            logits_acc_np = logits_acc.to(dtype=torch.float32).cpu().numpy()
 
         # Convert logits to desired output and save as TIFF
         if tifffile is None:
@@ -1168,13 +1181,13 @@ class Inferer():
             # Softmax over channel dimension
             # logits_acc: (C,Y,X) for 2D; (C,Z,Y,X) for 3D
             if self.is_2d_model:
-                m = logits_acc.max(axis=0, keepdims=True)
-                e = np.exp(logits_acc - m)
+                m = logits_acc_np.max(axis=0, keepdims=True)
+                e = np.exp(logits_acc_np - m)
                 s = e.sum(axis=0, keepdims=True) + 1e-8
                 out_arr = (e / s).astype(np.float32)  # (C,Y,X)
             else:
-                m = logits_acc.max(axis=0, keepdims=True)
-                e = np.exp(logits_acc - m)
+                m = logits_acc_np.max(axis=0, keepdims=True)
+                e = np.exp(logits_acc_np - m)
                 s = e.sum(axis=0, keepdims=True) + 1e-8
                 out_arr = (e / s).astype(np.float32)  # (C,Z,Y,X)
                 if Z == 1:
@@ -1184,9 +1197,9 @@ class Inferer():
         elif mode == 'argmax':
             # Argmax over channels to produce label map
             if self.is_2d_model:
-                out_arr = np.argmax(logits_acc, axis=0)  # (Y,X)
+                out_arr = np.argmax(logits_acc_np, axis=0)  # (Y,X)
             else:
-                out_arr = np.argmax(logits_acc, axis=0)  # (Z,Y,X)
+                out_arr = np.argmax(logits_acc_np, axis=0)  # (Z,Y,X)
                 if Z == 1:
                     out_arr = out_arr[0, :, :]
             # Convert labels to uint8; for binary classes map {0,1}->{0,255}
@@ -1196,7 +1209,7 @@ class Inferer():
                 out_arr = out_arr.astype(np.uint8)
         else:
             # mode == 'none': write raw logits as float32
-            out_arr = logits_acc.astype(np.float32)
+            out_arr = logits_acc_np.astype(np.float32)
             if not self.is_2d_model and Z == 1:
                 # Collapse singleton Z for 3D TIFFs that were actually 2D
                 out_arr = out_arr[:, 0, :, :]
@@ -1248,7 +1261,7 @@ class Inferer():
                     patch = np.zeros((pZ, pY, pX), dtype=np.float32)
                     patch[:sub.shape[0], :sub.shape[1], :sub.shape[2]] = sub
                     t = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).to(self.device)
-                with torch.no_grad(), torch.amp.autocast('cuda'):
+                with torch.no_grad(), torch.autocast(device_type=self.device.type):
                     if self.do_tta:
                         logits = infer_with_tta(
                             self.model,
@@ -1366,7 +1379,7 @@ class Inferer():
                     t = torch.from_numpy(patch).unsqueeze(0).to(self.device)
 
                     # Inference with TTA
-                    with torch.no_grad(), torch.amp.autocast('cuda'):
+                    with torch.no_grad(), torch.autocast(device_type=self.device.type):
                         if self.do_tta:
                             logits = infer_with_tta(
                                 self.model,

@@ -925,25 +925,21 @@ class Inferer():
     def _compute_patch_positions(self, img_shape: tuple) -> list:
         # For 3D models: img_shape is (Z,Y,X)
         # For 2D models: img_shape is (Y,X)
+        # Important: even if one dimension is smaller than the patch size, we should still
+        # slide along the other dimensions and pad as needed. Do NOT short‑circuit tiling.
         from vesuvius.utils.models.helpers import compute_steps_for_sliding_window
         if len(self.patch_size) == 3:
             pZ, pY, pX = self.patch_size
             Z, Y, X = img_shape
-            # If the image is smaller than the patch in any dimension, fall back to a single origin.
-            # Padding to patch size is handled by the caller before tensor creation.
-            if Z < pZ or Y < pY or X < pX:
-                return [(0, 0, 0)]
-            z_positions = compute_steps_for_sliding_window(Z, pZ, self.overlap)
-            y_positions = compute_steps_for_sliding_window(Y, pY, self.overlap)
-            x_positions = compute_steps_for_sliding_window(X, pX, self.overlap)
+            z_positions = [0] if Z < pZ else compute_steps_for_sliding_window(Z, pZ, self.overlap)
+            y_positions = [0] if Y < pY else compute_steps_for_sliding_window(Y, pY, self.overlap)
+            x_positions = [0] if X < pX else compute_steps_for_sliding_window(X, pX, self.overlap)
             return [(z, y, x) for z in z_positions for y in y_positions for x in x_positions]
         else:
             pY, pX = self.patch_size
             Y, X = img_shape
-            if Y < pY or X < pX:
-                return [(0, 0)]
-            y_positions = compute_steps_for_sliding_window(Y, pY, self.overlap)
-            x_positions = compute_steps_for_sliding_window(X, pX, self.overlap)
+            y_positions = [0] if Y < pY else compute_steps_for_sliding_window(Y, pY, self.overlap)
+            x_positions = [0] if X < pX else compute_steps_for_sliding_window(X, pX, self.overlap)
             return [(y, x) for y in y_positions for x in x_positions]
 
     def _infer_single_tiff_in_memory(self, img: np.ndarray, out_path: Path):

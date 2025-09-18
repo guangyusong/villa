@@ -8,6 +8,8 @@
 
 #include "ceres/ceres.h"
 #include <array>
+#include <algorithm>
+#include <cmath>
 #include <limits>
 #include <memory>
 #include <utility>
@@ -18,35 +20,72 @@ template <typename JetT>
 double  val(const JetT &v) { return v.a; }
 
 struct DistLoss {
-    DistLoss(float dist, float w) : _d(dist), _w(w) {};
-    template <typename T>
-    bool operator()(const T* const a, const T* const b, T* residual) const {
-        if (val(a[0]) == -1 && val(a[1]) == -1 && val(a[2]) == -1) {
-            residual[0] = T(0);
-            std::cout << "invalid DistLoss CORNER" << std::endl;
+    DistLoss(float dist, float w) : _d(dist), _w(w) {}
+
+    bool EvaluateResidual(const double* a,
+                          const double* b,
+                          double* residual,
+                          double* jacobian_a,
+                          double* jacobian_b) const {
+        constexpr double kInvalid = -1.0;
+        const bool a_invalid = (a[0] == kInvalid && a[1] == kInvalid && a[2] == kInvalid);
+        const bool b_invalid = (b[0] == kInvalid && b[1] == kInvalid && b[2] == kInvalid);
+        if (a_invalid || b_invalid) {
+            if (residual) {
+                residual[0] = 0.0;
+            }
+            if (jacobian_a) {
+                std::fill(jacobian_a, jacobian_a + 3, 0.0);
+            }
+            if (jacobian_b) {
+                std::fill(jacobian_b, jacobian_b + 3, 0.0);
+            }
             return true;
         }
-        if (val(b[0]) == -1 && val(b[1]) == -1 && val(b[2]) == -1) {
-            residual[0] = T(0);
-            std::cout << "invalid DistLoss CORNER" << std::endl;
-            return true;
+
+        double diff[3] = {
+            a[0] - b[0],
+            a[1] - b[1],
+            a[2] - b[2]
+        };
+        const double dist_sq = diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2];
+        const double dist = std::sqrt(dist_sq);
+        constexpr double kEps = 1e-12;
+
+        double jac_scale = 0.0;
+        double res = 0.0;
+
+        if (dist <= kEps) {
+            res = _w * (dist_sq - 1.0);
+            jac_scale = 2.0 * _w;
+        } else if (dist < _d) {
+            res = _w * (_d / dist - 1.0);
+            jac_scale = -_w * _d / (dist * dist * dist);
+        } else {
+            res = _w * (dist / _d - 1.0);
+            jac_scale = _w / (_d * dist);
         }
 
-        T d[3];
-        d[0] = a[0] - b[0];
-        d[1] = a[1] - b[1];
-        d[2] = a[2] - b[2];
-
-        T dist = sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
-
-        if (dist <= T(0)) {
-            residual[0] = T(_w)*(d[0]*d[0] + d[1]*d[1] + d[2]*d[2] - T(1));
+        if (residual) {
+            residual[0] = res;
         }
-        else {
-            if (dist < T(_d))
-                residual[0] = T(_w)*(T(_d)/dist - T(1));
-            else
-                residual[0] = T(_w)*(dist/T(_d) - T(1));
+
+        if (jacobian_a || jacobian_b) {
+            double grad[3] = {
+                jac_scale * diff[0],
+                jac_scale * diff[1],
+                jac_scale * diff[2]
+            };
+            if (jacobian_a) {
+                jacobian_a[0] = grad[0];
+                jacobian_a[1] = grad[1];
+                jacobian_a[2] = grad[2];
+            }
+            if (jacobian_b) {
+                jacobian_b[0] = -grad[0];
+                jacobian_b[1] = -grad[1];
+                jacobian_b[2] = -grad[2];
+            }
         }
 
         return true;
@@ -55,9 +94,28 @@ struct DistLoss {
     double _d;
     double _w;
 
-    static ceres::CostFunction* Create(float d, float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<DistLoss, 1, 3, 3>(new DistLoss(d, w));
+    class AnalyticCostFunction final : public ceres::SizedCostFunction<1, 3, 3> {
+    public:
+        AnalyticCostFunction(float dist, float w) : dist_(dist), weight_(w) {}
+
+        bool Evaluate(double const* const* parameters,
+                      double* residuals,
+                      double** jacobians) const override {
+            const double* a = parameters[0];
+            const double* b = parameters[1];
+            double* jac_a = (jacobians && jacobians[0]) ? jacobians[0] : nullptr;
+            double* jac_b = (jacobians && jacobians[1]) ? jacobians[1] : nullptr;
+            DistLoss(dist_, weight_).EvaluateResidual(a, b, residuals, jac_a, jac_b);
+            return true;
+        }
+
+    private:
+        double dist_;
+        double weight_;
+    };
+
+    static ceres::CostFunction* Create(float d, float w = 1.0) {
+        return new AnalyticCostFunction(d, w);
     }
 };
 
@@ -110,38 +168,124 @@ struct DistLoss2D {
 
 
 struct StraightLoss {
-    StraightLoss(float w) : _w(w) {};
-    template <typename T>
-    bool operator()(const T* const a, const T* const b, const T* const c, T* residual) const {
-        T d1[3], d2[3];
-        d1[0] = b[0] - a[0];
-        d1[1] = b[1] - a[1];
-        d1[2] = b[2] - a[2];
-        
-        d2[0] = c[0] - b[0];
-        d2[1] = c[1] - b[1];
-        d2[2] = c[2] - b[2];
-        
-        T l1 = sqrt(d1[0]*d1[0] + d1[1]*d1[1] + d1[2]*d1[2]);
-        T l2 = sqrt(d2[0]*d2[0] + d2[1]*d2[1] + d2[2]*d2[2]);
-        
-        T dot = (d1[0]*d2[0] + d1[1]*d2[1] + d1[2]*d2[2])/(l1*l2);
-        
+    StraightLoss(float w) : _w(w) {}
 
-        if (dot <= T(0.866)) {
-            T penalty = T(0.866)-dot;
-            residual[0] = T(_w)*(T(1)-dot) + T(_w*8)*penalty*penalty;
-        } else
-            residual[0] = T(_w)*(T(1)-dot);
+    bool EvaluateResidual(const double* a,
+                          const double* b,
+                          const double* c,
+                          double* residual,
+                          double* jacobian_a,
+                          double* jacobian_b,
+                          double* jacobian_c) const {
+        double d1[3] = {
+            b[0] - a[0],
+            b[1] - a[1],
+            b[2] - a[2]
+        };
+        double d2[3] = {
+            c[0] - b[0],
+            c[1] - b[1],
+            c[2] - b[2]
+        };
+
+        const double l1_sq = d1[0] * d1[0] + d1[1] * d1[1] + d1[2] * d1[2];
+        const double l2_sq = d2[0] * d2[0] + d2[1] * d2[1] + d2[2] * d2[2];
+        constexpr double kEps = 1e-12;
+
+        if (l1_sq < kEps || l2_sq < kEps) {
+            if (residual) {
+                residual[0] = 0.0;
+            }
+            if (jacobian_a) {
+                std::fill(jacobian_a, jacobian_a + 3, 0.0);
+            }
+            if (jacobian_b) {
+                std::fill(jacobian_b, jacobian_b + 3, 0.0);
+            }
+            if (jacobian_c) {
+                std::fill(jacobian_c, jacobian_c + 3, 0.0);
+            }
+            return true;
+        }
+
+        const double l1 = std::sqrt(l1_sq);
+        const double l2 = std::sqrt(l2_sq);
+        const double inv_l1 = 1.0 / l1;
+        const double inv_l2 = 1.0 / l2;
+
+        double n1[3] = { d1[0] * inv_l1, d1[1] * inv_l1, d1[2] * inv_l1 };
+        double n2[3] = { d2[0] * inv_l2, d2[1] * inv_l2, d2[2] * inv_l2 };
+
+        const double dot = n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2];
+        constexpr double kThreshold = 0.866;
+
+        double res = _w * (1.0 - dot);
+        if (dot <= kThreshold) {
+            const double penalty = kThreshold - dot;
+            res += _w * 8.0 * penalty * penalty;
+        }
+
+        if (residual) {
+            residual[0] = res;
+        }
+
+        const double dres_ddot = (dot <= kThreshold)
+            ? -_w - 16.0 * _w * (kThreshold - dot)
+            : -_w;
+
+        if (jacobian_a || jacobian_b || jacobian_c) {
+            double g1[3];
+            double g2[3];
+            for (int i = 0; i < 3; ++i) {
+                g1[i] = (n2[i] - dot * n1[i]) * inv_l1;
+                g2[i] = (n1[i] - dot * n2[i]) * inv_l2;
+            }
+
+            if (jacobian_a) {
+                for (int i = 0; i < 3; ++i) {
+                    jacobian_a[i] = -dres_ddot * g1[i];
+                }
+            }
+            if (jacobian_b) {
+                for (int i = 0; i < 3; ++i) {
+                    jacobian_b[i] = dres_ddot * (g1[i] - g2[i]);
+                }
+            }
+            if (jacobian_c) {
+                for (int i = 0; i < 3; ++i) {
+                    jacobian_c[i] = dres_ddot * g2[i];
+                }
+            }
+        }
 
         return true;
     }
 
     float _w;
 
-    static ceres::CostFunction* Create(float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<StraightLoss, 1, 3, 3, 3>(new StraightLoss(w));
+    class AnalyticCostFunction final : public ceres::SizedCostFunction<1, 3, 3, 3> {
+    public:
+        explicit AnalyticCostFunction(float w) : weight_(w) {}
+
+        bool Evaluate(double const* const* parameters,
+                      double* residuals,
+                      double** jacobians) const override {
+            const double* a = parameters[0];
+            const double* b = parameters[1];
+            const double* c = parameters[2];
+            double* jac_a = (jacobians && jacobians[0]) ? jacobians[0] : nullptr;
+            double* jac_b = (jacobians && jacobians[1]) ? jacobians[1] : nullptr;
+            double* jac_c = (jacobians && jacobians[2]) ? jacobians[2] : nullptr;
+            StraightLoss(weight_).EvaluateResidual(a, b, c, residuals, jac_a, jac_b, jac_c);
+            return true;
+        }
+
+    private:
+        double weight_;
+    };
+
+    static ceres::CostFunction* Create(float w = 1.0) {
+        return new AnalyticCostFunction(w);
     }
 };
 

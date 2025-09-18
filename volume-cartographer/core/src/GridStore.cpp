@@ -1,15 +1,25 @@
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/LineSegList.hpp"
+#include "vc/core/util/Logging.hpp"
+
+#include <fmt/core.h>
 
 #include <unordered_set>
 #include <fstream>
 #include <stdexcept>
 #include <numeric>
+#include <system_error>
+#include <cerrno>
+#include <filesystem>
+#include <optional>
+#include <string_view>
+#include <algorithm>
 
 #include <arpa/inet.h>
 
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -18,6 +28,104 @@ namespace vc::core::util {
 namespace {
 constexpr uint32_t GRIDSTORE_MAGIC = 0x56434753; // "VCGS"
 constexpr uint32_t GRIDSTORE_VERSION = 1;
+
+#if defined(__linux__)
+auto CountOpenFiles() -> std::optional<size_t> {
+    namespace fs = std::filesystem;
+    const fs::path fd_dir{"/proc/self/fd"};
+
+    std::error_code ec;
+    if (!fs::exists(fd_dir, ec) || ec) {
+        return std::nullopt;
+    }
+
+    size_t count = 0;
+    for (fs::directory_iterator it(fd_dir, ec); !ec && it != fs::directory_iterator(); ++it) {
+        ++count;
+    }
+
+    if (ec) {
+        return std::nullopt;
+    }
+
+    return count;
+}
+
+auto FileDescriptorLimits() -> std::optional<std::pair<rlim_t, rlim_t>> {
+    struct rlimit limits {};
+    if (getrlimit(RLIMIT_NOFILE, &limits) == 0) {
+        return std::make_pair(limits.rlim_cur, limits.rlim_max);
+    }
+    return std::nullopt;
+}
+#else
+auto CountOpenFiles() -> std::optional<size_t> {
+    return std::nullopt;
+}
+
+auto FileDescriptorLimits() -> std::optional<std::pair<rlim_t, rlim_t>> {
+    return std::nullopt;
+}
+#endif
+
+auto LimitToString(rlim_t value) -> std::string {
+    if (value == RLIM_INFINITY) {
+        return "infinity";
+    }
+    return std::to_string(static_cast<unsigned long long>(value));
+}
+
+auto DescribeFileUsage() -> std::string {
+    const auto open_files = CountOpenFiles();
+    const auto limits = FileDescriptorLimits();
+
+    const std::string open_desc = open_files ? std::to_string(*open_files) : "unknown";
+    const std::string soft_desc = limits ? LimitToString(limits->first) : "unknown";
+    const std::string hard_desc = limits ? LimitToString(limits->second) : "unknown";
+
+    return fmt::format("open_fds={} soft_limit={} hard_limit={}", open_desc, soft_desc, hard_desc);
+}
+
+// Per-thread structures that let us deduplicate bucket handles without allocating.
+struct ThreadLocalHandleCache {
+    std::vector<uint32_t> generations;
+    std::vector<int> handles;
+    uint32_t current_generation = 1;
+};
+
+// Accessor for the thread-local cache used while gathering GridStore handles.
+auto HandleCache() -> ThreadLocalHandleCache& {
+    thread_local ThreadLocalHandleCache cache;
+    return cache;
+}
+
+void CloseFd(int& fd, const std::string& path, std::string_view context) {
+    if (fd == -1) {
+        return;
+    }
+
+    while (true) {
+        if (close(fd) == 0) {
+            fd = -1;
+            return;
+        }
+
+        if (errno == EINTR) {
+            continue;
+        }
+
+        auto ec = std::error_code(errno, std::generic_category());
+        Logger()->warn(
+            "GridStore {} failed to close fd for '{}' ({}) : {}",
+            context,
+            path,
+            ec.value(),
+            ec.message()
+        );
+        fd = -1;
+        return;
+    }
+}
 }
 
 struct MmappedData {
@@ -70,8 +178,22 @@ public:
         }
     }
 
+    // Reuses a thread-local generation array to deduplicate bucket handles without hashing.
     std::vector<std::shared_ptr<std::vector<cv::Point>>> get(const cv::Rect& query_rect) const {
-        std::unordered_set<int> handles;
+        auto& cache = HandleCache();
+        auto& generations = cache.generations;
+        auto& handles = cache.handles;
+
+        if (generations.size() < storage_.size()) {
+            generations.resize(storage_.size(), 0);
+        }
+
+        if (++cache.current_generation == 0) {
+            std::fill(generations.begin(), generations.end(), 0);
+            cache.current_generation = 1;
+        }
+
+        handles.clear();
         cv::Rect clamped_rect = query_rect & bounds_;
 
         cv::Point start = (clamped_rect.tl() - bounds_.tl()) / cell_size_;
@@ -81,7 +203,15 @@ public:
             for (int x = start.x; x <= end.x; ++x) {
                 int index = y * grid_size_.width + x;
                 if (index >= 0 && index < grid_.size()) {
-                    handles.insert(grid_[index].begin(), grid_[index].end());
+                    for (int handle : grid_[index]) {
+                        if (handle < 0 || static_cast<size_t>(handle) >= generations.size()) {
+                            continue;
+                        }
+                        if (generations[handle] != cache.current_generation) {
+                            generations[handle] = cache.current_generation;
+                            handles.push_back(handle);
+                        }
+                    }
                 }
             }
         }
@@ -260,7 +390,15 @@ public:
         // Write buffer to file
         std::ofstream file(path, std::ios::binary);
         if (!file) {
-            throw std::runtime_error("Failed to open file for writing: " + path);
+            auto ec = std::error_code(errno, std::generic_category());
+            Logger()->error(
+                "GridStore save failed to open '{}' ({}) : {} [{}]",
+                path,
+                ec.value(),
+                ec.message(),
+                DescribeFileUsage()
+            );
+            throw std::system_error(ec, "Failed to open file for writing: " + path);
         }
         file.write(buffer.data(), buffer.size());
     }
@@ -271,17 +409,35 @@ public:
 
         mmapped_data_->fd = open(path.c_str(), O_RDONLY);
         if (mmapped_data_->fd == -1) {
-            throw std::runtime_error("Failed to open file: " + path);
+            auto ec = std::error_code(errno, std::generic_category());
+            Logger()->error(
+                "GridStore load failed to open '{}' ({}) : {} [{}]",
+                path,
+                ec.value(),
+                ec.message(),
+                DescribeFileUsage()
+            );
+            throw std::system_error(ec, "Failed to open file: " + path);
         }
 
         struct stat sb;
         if (fstat(mmapped_data_->fd, &sb) == -1) {
-            throw std::runtime_error("Failed to stat file: " + path);
+            auto ec = std::error_code(errno, std::generic_category());
+            Logger()->error(
+                "GridStore load failed to stat '{}' ({}) : {} [{}]",
+                path,
+                ec.value(),
+                ec.message(),
+                DescribeFileUsage()
+            );
+            CloseFd(mmapped_data_->fd, path, "load (fstat)");
+            throw std::system_error(ec, "Failed to stat file: " + path);
         }
         mmapped_data_->size = sb.st_size;
 
         if (mmapped_data_->size == 0) {
             // Handle empty file: Grid is already empty, just set bounds and return.
+            CloseFd(mmapped_data_->fd, path, "load (empty)");
             bounds_ = cv::Rect();
             cell_size_ = 1; // Avoid division by zero
             grid_size_ = cv::Size(0,0);
@@ -290,8 +446,18 @@ public:
 
         mmapped_data_->data = mmap(NULL, mmapped_data_->size, PROT_READ, MAP_PRIVATE, mmapped_data_->fd, 0);
         if (mmapped_data_->data == MAP_FAILED) {
-            throw std::runtime_error("Failed to mmap file: " + path);
+            auto ec = std::error_code(errno, std::generic_category());
+            Logger()->error(
+                "GridStore load failed to mmap '{}' ({}) : {} [{}]",
+                path,
+                ec.value(),
+                ec.message(),
+                DescribeFileUsage()
+            );
+            CloseFd(mmapped_data_->fd, path, "load (mmap)");
+            throw std::system_error(ec, "Failed to mmap file: " + path);
         }
+        CloseFd(mmapped_data_->fd, path, "load (post-mmap)");
 
         const char* current = static_cast<const char*>(mmapped_data_->data);
         const char* end = current + mmapped_data_->size;

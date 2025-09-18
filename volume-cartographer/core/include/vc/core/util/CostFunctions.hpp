@@ -7,6 +7,10 @@
 #include <opencv2/core.hpp>
 
 #include "ceres/ceres.h"
+#include <array>
+#include <limits>
+#include <memory>
+#include <utility>
 
 
 static double  val(const double &v) { return v; }
@@ -870,12 +874,28 @@ struct NormalConstraintPlane {
         return normal_loss + T(0.1)*snapping_loss;
     }
 
+    bool evaluate_analytic(const double* pA,
+                           const double* pB1,
+                           const double* pB2,
+                           const double* pC,
+                           double* residual,
+                           std::array<std::array<double, 3>, 4>* jacobians) const;
+
+    bool calculate_normal_snapping_loss_analytic(const std::array<double, 2>& p1,
+                                                 const std::array<double, 2>& p2,
+                                                 const cv::Point3f& query_point,
+                                                 int plane_idx,
+                                                 int grid_idx,
+                                                 double* out_loss,
+                                                 std::array<double, 2>* grad_p1,
+                                                 std::array<double, 2>* grad_p2) const;
+
     static float seg_dist_sq_appx(cv::Point2f p1, cv::Point2f p2, cv::Point2f p3, cv::Point2f p4)
     {
-        cv::Point2f p = 0.5*(p1+p2);
-        cv::Point2f s = 0.5*(p3+p4);
-        cv::Point2f d = p-s;
-        return d.x*d.x+d.y*d.y;
+        cv::Point2f p = 0.5f * (p1 + p2);
+        cv::Point2f s = 0.5f * (p3 + p4);
+        cv::Point2f d = p - s;
+        return d.x * d.x + d.y * d.y;
     }
 
     static float seg_dist_sq(cv::Point2f p1, cv::Point2f p2, cv::Point2f p3, cv::Point2f p4) {
@@ -887,25 +907,43 @@ struct NormalConstraintPlane {
         float a = dot(u, u); float b = dot(u, v); float c = dot(v, v);
         float d = dot(u, w); float e = dot(v, w); float D = a * c - b * b;
         float sc, sN, sD = D; float tc, tN, tD = D;
-        if (D < 1e-7) { sN = 0.0; sD = 1.0; tN = e; tD = c; }
+        if (D < 1e-7f) { sN = 0.0f; sD = 1.0f; tN = e; tD = c; }
         else { sN = (b * e - c * d); tN = (a * e - b * d);
-            if (sN < 0.0) { sN = 0.0; tN = e; tD = c; }
+            if (sN < 0.0f) { sN = 0.0f; tN = e; tD = c; }
             else if (sN > sD) { sN = sD; tN = e + b; tD = c; }
         }
-        if (tN < 0.0) { tN = 0.0;
-            if (-d < 0.0) sN = 0.0; else if (-d > a) sN = sD;
+        if (tN < 0.0f) { tN = 0.0f;
+            if (-d < 0.0f) sN = 0.0f; else if (-d > a) sN = sD;
             else { sN = -d; sD = a; }
         } else if (tN > tD) { tN = tD;
-            if ((-d + b) < 0.0) sN = 0.0; else if ((-d + b) > a) sN = sD;
+            if ((-d + b) < 0.0f) sN = 0.0f; else if ((-d + b) > a) sN = sD;
             else { sN = (-d + b); sD = a; }
         }
-        sc = (std::abs(sN) < 1e-7 ? 0.0 : sN / sD);
-        tc = (std::abs(tN) < 1e-7 ? 0.0 : tN / tD);
+        sc = (std::abs(sN) < 1e-7f ? 0.0f : sN / sD);
+        tc = (std::abs(tN) < 1e-7f ? 0.0f : tN / tD);
         cv::Point2f dP = w + (sc * u) - (tc * v);
         return dist_sq(dP);
     }
 
-    static ceres::CostFunction* Create(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight) {
+    class AnalyticCostFunction final : public ceres::SizedCostFunction<1, 3, 3, 3, 3> {
+    public:
+        AnalyticCostFunction(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight);
+
+        bool Evaluate(double const* const* parameters,
+                      double* residuals,
+                      double** jacobians) const override;
+
+    private:
+        mutable std::unique_ptr<NormalConstraintPlane> functor_;
+    };
+
+    static ceres::CostFunction* Create(const vc::core::util::NormalGridVolume& normal_grid_volume,
+                                       int plane_idx,
+                                       double weight,
+                                       bool use_analytic = false) {
+        if (use_analytic) {
+            return new AnalyticCostFunction(normal_grid_volume, plane_idx, weight);
+        }
         return new ceres::AutoDiffCostFunction<NormalConstraintPlane, 1, 3, 3, 3, 3>(
             new NormalConstraintPlane(normal_grid_volume, plane_idx, weight)
         );

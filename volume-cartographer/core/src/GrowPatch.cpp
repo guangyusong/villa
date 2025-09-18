@@ -25,14 +25,20 @@
 static float space_trace_dist_w = 1.0;
 float dist_th = 1.5;
 static float normal_loss_w = 1.0;
+static float space_line_loss_w = 0.1f;
 
 // global CUDA to allow use to set to false globally
 // in the case they have cuda avail, but do not want to use it
 static bool g_use_cuda = true;
+static bool g_use_normal_loss_analytic = false;
 
 // Expose a simple toggle for CUDA usage so tools can honor JSON settings
 void set_space_tracing_use_cuda(bool enable) {
     g_use_cuda = enable;
+}
+
+void set_normal_loss_use_analytic(bool enable) {
+    g_use_normal_loss_analytic = enable;
 }
 
 
@@ -165,13 +171,13 @@ static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_
     // int i = 1;
     for (int i = 0; i < 3; ++i) { // For each plane
         // Loss with p as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w), nullptr, pA, pB1, pB2, pC);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w, g_use_normal_loss_analytic), nullptr, pA, pB1, pB2, pC);
         // Loss with p_tr as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w), nullptr, pB1, pC, pA, pB2);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w, g_use_normal_loss_analytic), nullptr, pB1, pC, pA, pB2);
         // Loss with p_bl as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w), nullptr, pB2, pA, pC, pB1);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w, g_use_normal_loss_analytic), nullptr, pB2, pA, pC, pB1);
         // Loss with p_br as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w), nullptr, pC, pB2, pB1, pA);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*ngv, i, w, g_use_normal_loss_analytic), nullptr, pC, pB2, pB1, pA);
         count += 4;
     }
 
@@ -331,12 +337,12 @@ static int emptytrace_create_centered_losses(ceres::Problem &problem, const cv::
 
     if (flags & SPACE_LOSS) {
     //     count += gen_space_loss(problem, p, state, loc, t);
-    //
-    //     count += gen_space_line_loss(problem, p, {1,0}, state, loc, t, unit);
-    //     count += gen_space_line_loss(problem, p, {-1,0}, state, loc, t, unit);
-    //     count += gen_space_line_loss(problem, p, {0,1}, state, loc, t, unit);
-    //     count += gen_space_line_loss(problem, p, {0,-1}, state, loc, t, unit);
-    //
+
+        //count += gen_space_line_loss(problem, p, {1,0}, state, loc, t, unit, space_line_loss_w);
+        //count += gen_space_line_loss(problem, p, {-1,0}, state, loc, t, unit, space_line_loss_w);
+        //count += gen_space_line_loss(problem, p, {0,1}, state, loc, t, unit, space_line_loss_w);
+        //count += gen_space_line_loss(problem, p, {0,-1}, state, loc, t, unit, space_line_loss_w);
+
     //     count += gen_direction_loss(problem, p, 1, state, loc, direction_fields);
     //     count += gen_direction_loss(problem, p, -1, state, loc, direction_fields);
         //TODO normal_loss currently implies OPTIMIZE_ALL - do physics only for now
@@ -351,11 +357,11 @@ static int emptytrace_create_centered_losses(ceres::Problem &problem, const cv::
 
 template <typename T, typename C>
 static int conditional_spaceline_loss(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::Mat_<uint16_t> &loss_status,
-    ceres::Problem &problem, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &loc, Chunked3d<T,C> &t, int steps)
+    ceres::Problem &problem, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &loc, Chunked3d<T,C> &t, int steps, float w)
 {
     int set = 0;
     if (!loss_mask(bit, p, off, loss_status))
-        set = set_loss_mask(bit, p, off, loss_status, gen_space_line_loss(problem, p, off, state, loc, t, steps));
+        set = set_loss_mask(bit, p, off, loss_status, gen_space_line_loss(problem, p, off, state, loc, t, steps, w));
     return set;
 };
 
@@ -408,13 +414,13 @@ static int emptytrace_create_missing_centered_losses(ceres::Problem &problem, cv
     if (flags & SPACE_LOSS) {
     //     if (!loss_mask(6, p, {0,0}, loss_status))
     //         count += set_loss_mask(6, p, {0,0}, loss_status, gen_space_loss(problem, p, state, loc, t));
-    //
-    //     count += conditional_spaceline_loss(7, p, {1,0}, loss_status, problem, state, loc, t, unit);
-    //     count += conditional_spaceline_loss(7, p, {-1,0}, loss_status, problem, state, loc, t, unit);
-    //
-    //     count += conditional_spaceline_loss(8, p, {0,1}, loss_status, problem, state, loc, t, unit);
-    //     count += conditional_spaceline_loss(8, p, {0,-1}, loss_status, problem, state, loc, t, unit);
-    //
+
+        //count += conditional_spaceline_loss(7, p, {1,0}, loss_status, problem, state, loc, t, unit, space_line_loss_w);
+        //count += conditional_spaceline_loss(7, p, {-1,0}, loss_status, problem, state, loc, t, unit, space_line_loss_w);
+
+        //count += conditional_spaceline_loss(8, p, {0,1}, loss_status, problem, state, loc, t, unit, space_line_loss_w);
+        //count += conditional_spaceline_loss(8, p, {0,-1}, loss_status, problem, state, loc, t, unit, space_line_loss_w);
+
     //     count += conditional_direction_loss(9, p, 1, loss_status, problem, state, loc, direction_fields);
     //     count += conditional_direction_loss(9, p, -1, loss_status, problem, state, loc, direction_fields);
         count += conditional_normal_loss(10, p                 , loss_status, problem, state, loc, ngv);
@@ -603,6 +609,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     int stop_gen = params.value("generations", 100);
     float step = params.value("step_size", 20.0f);
     int rewind_gen = params.value("rewind_gen", -1);
+    space_line_loss_w = params.value("space_line_loss_weight", space_line_loss_w);
     ALifeTime f_timer("empty space tracing\n");
     DSReader reader = {ds,scale,cache};
     std::unique_ptr<vc::core::util::NormalGridVolume> ngv;

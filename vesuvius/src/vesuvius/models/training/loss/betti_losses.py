@@ -13,7 +13,6 @@ To install and use this loss, make sure you run the build_betti.py script in ves
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 from typing import Dict, Tuple
 
@@ -86,7 +85,10 @@ def _loss_unmatched(pairs: torch.Tensor, push_to: str = "diagonal") -> torch.Ten
 
 def _compute_loss_from_result(pred_field: torch.Tensor,
                               tgt_field: torch.Tensor,
-                              res) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+                              res,
+                              *,
+                              include_unmatched_target: bool,
+                              push_to: str) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Mirror of scratch/_betti_matching_loss using our binding attribute names."""
     # Matched coordinates (concatenate across homology dimensions)
     def _concat(list_of_arrays):
@@ -138,17 +140,23 @@ def _compute_loss_from_result(pred_field: torch.Tensor,
     # Unmatched pairs (default push to diagonal)
     pred_unmatched_pairs = _stack_pairs(pred_unmatched_birth_vals, pred_unmatched_death_vals)
     tgt_unmatched_pairs = _stack_pairs(tgt_unmatched_birth_vals, tgt_unmatched_death_vals)
-    loss_unmatched_pred = _loss_unmatched(pred_unmatched_pairs, push_to="diagonal")
-    loss_unmatched_tgt = _loss_unmatched(tgt_unmatched_pairs, push_to="diagonal")
+    loss_unmatched_pred = _loss_unmatched(pred_unmatched_pairs, push_to=push_to)
 
-    total = loss_matched + loss_unmatched_pred + loss_unmatched_tgt
+    total = loss_matched + loss_unmatched_pred
+
+    loss_unmatched_tgt = pred_field.new_zeros(())
+    if include_unmatched_target:
+        tgt_unmatched_pairs = _stack_pairs(tgt_unmatched_birth_vals, tgt_unmatched_death_vals)
+        loss_unmatched_tgt = _loss_unmatched(tgt_unmatched_pairs, push_to=push_to)
+        total = total + loss_unmatched_tgt
 
     # Auxiliary stats (detached)
     aux = {
         "Betti matching loss (matched)": loss_matched.reshape(1).detach(),
         "Betti matching loss (unmatched prediction)": loss_unmatched_pred.reshape(1).detach(),
-        "Betti matching loss (unmatched target)": loss_unmatched_tgt.reshape(1).detach(),
     }
+    if include_unmatched_target:
+        aux["Betti matching loss (unmatched target)"] = loss_unmatched_tgt.reshape(1).detach()
     return total.reshape(1), aux
 
 
@@ -160,12 +168,20 @@ class BettiMatchingLoss(nn.Module):
 
     Parameters:
     - filtration: 'superlevel' | 'sublevel' | 'bothlevel'
+    - include_unmatched_target: whether to penalize unmatched target pairs (mirrors scratch include_unmatched_target)
+    - push_unmatched_to: 'diagonal' | 'one_zero' | 'death_death'
     """
 
-    def __init__(self, filtration: str = 'superlevel'):
+    def __init__(self,
+                 filtration: str = 'superlevel',
+                 include_unmatched_target: bool = False,
+                 push_unmatched_to: str = 'diagonal'):
         super().__init__()
         assert filtration in ('superlevel', 'sublevel', 'bothlevel'), "filtration must be one of: superlevel, sublevel, bothlevel"
+        assert push_unmatched_to in ('diagonal', 'one_zero', 'death_death'), "push_unmatched_to must be one of: diagonal, one_zero, death_death"
         self.filtration = filtration
+        self.include_unmatched_target = include_unmatched_target
+        self.push_unmatched_to = push_unmatched_to
 
     def forward(self, input: torch.Tensor, target: torch.Tensor):
         """Compute Betti matching loss matching the scratch example semantics.
@@ -177,7 +193,10 @@ class BettiMatchingLoss(nn.Module):
         device = input.device
         batch_size = input.shape[0]
         num_channels = input.shape[1]
-        is_3d = (input.ndim == 5)
+
+        if batch_size == 0:
+            zero = input.new_tensor(0.0)
+            return zero, {}
 
         # Select foreground channel and normalize to [0,1] if needed
         if num_channels == 2:
@@ -188,57 +207,91 @@ class BettiMatchingLoss(nn.Module):
             pred_fg = torch.sigmoid(input) if not (input.min() >= 0 and input.max() <= 1) else input
             tgt_fg = target
 
+        pred_fg = pred_fg.contiguous()
+        tgt_fg = tgt_fg.contiguous()
 
-        # Build lists for a single batched call to the C++ extension
-        preds_fields = [pred_fg[b].squeeze(0) for b in range(batch_size)]
-        tgts_fields = [tgt_fg[b].squeeze(0) for b in range(batch_size)]
+        # Build lists for batched calls to the C++ extension
+        preds_fields = [pred_fg[b, 0].contiguous() for b in range(batch_size)]
+        tgts_fields = [tgt_fg[b, 0].contiguous() for b in range(batch_size)]
 
-        preds_np = [np.ascontiguousarray(p.detach().cpu().numpy().astype(np.float64)) for p in preds_fields]
-        tgts_np = [np.ascontiguousarray(t.detach().cpu().numpy().astype(np.float64)) for t in tgts_fields]
-
-        # Binarize targets (training targets are masks)
-        tgts_np = [(t > 0.5).astype(np.float64) for t in tgts_np]
+        def _to_numpy(fields):
+            return [np.ascontiguousarray(f.detach().cpu().numpy().astype(np.float64)) for f in fields]
 
         total_losses = []
         aux_parts = []
 
         if self.filtration == 'bothlevel':
-            preds_super = [1.0 - p for p in preds_np]
-            tgts_super = [1.0 - t for t in tgts_np]
+            preds_sub_fields = preds_fields
+            tgts_sub_fields = tgts_fields
+            preds_super_fields = [1.0 - p for p in preds_fields]
+            tgts_super_fields = [1.0 - t for t in tgts_fields]
 
             results_super = bm.compute_matching(
-                preds_super, tgts_super,
+                _to_numpy(preds_super_fields),
+                _to_numpy(tgts_super_fields),
                 include_input1_unmatched_pairs=True,
-                include_input2_unmatched_pairs=True
+                include_input2_unmatched_pairs=self.include_unmatched_target,
             )
             results_sub = bm.compute_matching(
-                preds_np, tgts_np,
+                _to_numpy(preds_sub_fields),
+                _to_numpy(tgts_sub_fields),
                 include_input1_unmatched_pairs=True,
-                include_input2_unmatched_pairs=True
+                include_input2_unmatched_pairs=self.include_unmatched_target,
             )
 
             for b in range(batch_size):
-                loss_super, aux_super = _compute_loss_from_result(preds_fields[b], tgts_fields[b], results_super[b])
-                loss_sub, aux_sub = _compute_loss_from_result(preds_fields[b], tgts_fields[b], results_sub[b])
-                # Match scratch/Betti-matching-master semantics: sum superlevel + sublevel
-                total_losses.append(loss_super + loss_sub)
-                aux_parts.append({k: (aux_super[k] + aux_sub[k]) for k in aux_super.keys()})
+                loss_super, aux_super = _compute_loss_from_result(
+                    preds_super_fields[b],
+                    tgts_super_fields[b],
+                    results_super[b],
+                    include_unmatched_target=self.include_unmatched_target,
+                    push_to=self.push_unmatched_to,
+                )
+                loss_sub, aux_sub = _compute_loss_from_result(
+                    preds_sub_fields[b],
+                    tgts_sub_fields[b],
+                    results_sub[b],
+                    include_unmatched_target=self.include_unmatched_target,
+                    push_to=self.push_unmatched_to,
+                )
+
+                total_losses.append(0.5 * (loss_super + loss_sub))
+
+                keys = set(aux_super.keys()) | set(aux_sub.keys())
+                combined_aux: Dict[str, torch.Tensor] = {}
+                for k in keys:
+                    val_super = aux_super.get(k)
+                    val_sub = aux_sub.get(k)
+                    if val_super is not None and val_sub is not None:
+                        combined_aux[k] = 0.5 * (val_super + val_sub)
+                    elif val_super is not None:
+                        combined_aux[k] = 0.5 * val_super
+                    elif val_sub is not None:
+                        combined_aux[k] = 0.5 * val_sub
+                aux_parts.append(combined_aux)
         else:
             if self.filtration == 'superlevel':
-                preds_in = [1.0 - p for p in preds_np]
-                tgts_in = [1.0 - t for t in tgts_np]
+                preds_proc_fields = [1.0 - p for p in preds_fields]
+                tgts_proc_fields = [1.0 - t for t in tgts_fields]
             else:
-                preds_in = preds_np
-                tgts_in = tgts_np
+                preds_proc_fields = preds_fields
+                tgts_proc_fields = tgts_fields
 
             results = bm.compute_matching(
-                preds_in, tgts_in,
+                _to_numpy(preds_proc_fields),
+                _to_numpy(tgts_proc_fields),
                 include_input1_unmatched_pairs=True,
-                include_input2_unmatched_pairs=True
+                include_input2_unmatched_pairs=self.include_unmatched_target,
             )
 
             for b in range(batch_size):
-                loss_b, aux_b = _compute_loss_from_result(preds_fields[b], tgts_fields[b], results[b])
+                loss_b, aux_b = _compute_loss_from_result(
+                    preds_proc_fields[b],
+                    tgts_proc_fields[b],
+                    results[b],
+                    include_unmatched_target=self.include_unmatched_target,
+                    push_to=self.push_unmatched_to,
+                )
                 total_losses.append(loss_b)
                 aux_parts.append(aux_b)
 
@@ -247,9 +300,10 @@ class BettiMatchingLoss(nn.Module):
         # Aggregate aux
         aux_agg: Dict[str, torch.Tensor] = {}
         if len(aux_parts) > 0:
-            keys = aux_parts[0].keys()
-            for k in keys:
-                aux_agg[k] = torch.mean(torch.cat([d[k] for d in aux_parts]))
+            all_keys = set().union(*(d.keys() for d in aux_parts))
+            for k in all_keys:
+                values = [d[k] for d in aux_parts if k in d]
+                aux_agg[k] = torch.mean(torch.cat(values))
 
         # Return tuple to make DeepSupervisionWrapper pick the scalar part automatically
         return loss, aux_agg

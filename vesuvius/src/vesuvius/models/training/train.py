@@ -20,7 +20,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.nn.functional as F
 from vesuvius.models.training.lr_schedulers import get_scheduler, PolyLRScheduler
-from torch.utils.data import DataLoader, SubsetRandomSampler, Subset
+from torch.utils.data import DataLoader, SubsetRandomSampler, Subset, WeightedRandomSampler
 from torch.utils.data.distributed import DistributedSampler
 from vesuvius.models.utils import InitWeights_He
 from vesuvius.models.datasets import NapariDataset, ImageDataset, ZarrDataset
@@ -579,7 +579,30 @@ class BaseTrainer:
             # For validation we only run on rank 0; sampler unused there, but keep a sequential sampler for completeness
             val_sampler = None
         else:
-            train_sampler = SubsetRandomSampler(list(range(len(train_subset))))
+            if hasattr(train_base, 'patch_weights') and isinstance(getattr(train_base, 'patch_weights', None), list):
+                if train_base.patch_weights and len(train_base.patch_weights) >= len(train_base):
+                    subset_weights = [train_base.patch_weights[idx] for idx in train_indices]
+                    total_weight = float(sum(subset_weights))
+                    if total_weight > 0:
+                        weight_tensor = torch.tensor(subset_weights, dtype=torch.double)
+                        generator = None
+                        if hasattr(self.mgr, 'seed') and self.mgr.seed is not None:
+                            generator = torch.Generator()
+                            generator.manual_seed(int(self.mgr.seed))
+                        train_sampler = WeightedRandomSampler(
+                            weights=weight_tensor,
+                            num_samples=len(subset_weights),
+                            replacement=True,
+                            generator=generator
+                        )
+                        if self.mgr.verbose:
+                            print("Using WeightedRandomSampler with slice sampling weights")
+                    else:
+                        train_sampler = SubsetRandomSampler(list(range(len(train_subset))))
+                else:
+                    train_sampler = SubsetRandomSampler(list(range(len(train_subset))))
+            else:
+                train_sampler = SubsetRandomSampler(list(range(len(train_subset))))
             val_sampler = SubsetRandomSampler(list(range(len(val_subset))))
 
         pin_mem = True if self.device.type == 'cuda' else False

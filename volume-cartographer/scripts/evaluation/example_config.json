@@ -1,14 +1,14 @@
 {
-  "z_range": [2000, 2400],
-  "surface_zarr_volume": "../volpkgs/PHerc0172.volpkg/volumes/s5_059_medial_ome.zarr",
-  "bin_path": "./cmake-build-relwithdebinfo/bin",
-  "wrap_labels": "../volpkgs/PHerc0172.volpkg/wrap_labels.json",
-  "existing_patches_for_seeds": "../volpkgs/PHerc0172.volpkg/paths_orig",
-  "out_path": "../out/vc-trace-evaluation/debug",
+  "z_range": [0, 21000],
+  "surface_zarr_volume": "/mnt/raid_nvme/volpkgs/PHerc172.volpkg/volumes/s5_105.zarr/",
+  "bin_path": "/home/sean/Documents/vc_test/villa/volume-cartographer/build/bin",
+  "wrap_labels": "/mnt/raid_nvme/volpkgs/PHerc172.volpkg/wrap_labels.json",
+  "existing_patches_for_seeds": "/mnt/raid_nvme/volpkgs/PHerc172.volpkg/paths_0829/",
+  "out_path": "/mnt/raid_nvme/volpkgs/PHerc172.volpkg/",
   "use_existing_patches": false,
   "max_num_seeds": 1000000,
-  "seeding_parallel_processes": 14,
-  "num_expansion_patches": 250,
+  "seeding_parallel_processes": 16,
+  "num_expansion_patches": 5000,
   "num_trace_starting_patches": 3,
   "min_trace_starting_patch_size": 7.0,
   "num_best_traces_to_average": 2,
@@ -18,26 +18,33 @@
   "vc_grow_seg_from_seed_params": {
     "seeding": {
       "step_size": 20,
-      "min_area_cm": 0.2,
-      "generations": 200,
+      "min_area_cm": 0.3,
+      "generations": 50,
       "thread_limit": 1,
-      "cache_root": "../volpkgs/PHerc0172.volpkg/cache",
-      "direction_fields": [
-        {
-          "zarr": "../out/s5-fiber-directions.zarr/horizontal",
-          "dir": "horizontal",
-          "scale": 2
-        }
-      ]
+      "use_cuda": false,
+      "normal_grid_path": "/mnt/raid_nvme/volpkgs/PHerc172.volpkg/n_grid",
+      "cache_root": "/mnt/raid_nvme/volpkgs/caches/172_edt_cache/",
+      "space_line_loss_weight": 0.01
     },
     "expansion": {
       "step_size": 20,
-      "min_area_cm": 0.2,
+      "min_area_cm": 0.3,
       "tgt_overlap_count": 10,
       "generations": 200,
       "thread_limit": 1,
-      "cache_root": "../volpkgs/PHerc0172.volpkg/cache",
-      "direction_fields": []
+      "cache_root": "/mnt/raid_nvme/volpkgs/PHerc172.volpkg/cache",
+      "direction_fields": [
+        {
+          "zarr": "/mnt/raid_nvme/volpkgs/PHerc172.volpkg/s5_fiber_fields.zarr/horizontal",
+          "dir": "horizontal",
+          "scale": 2
+        },
+	{
+          "zarr": "/mnt/raid_nvme/volpkgs/PHerc172.volpkg/s5_fiber_fields.zarr/vertical",
+          "dir": "vertical",
+          "scale": 2
+        }
+      ]
     }
   },
   

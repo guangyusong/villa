@@ -1304,29 +1304,13 @@ int main(int argc, char *argv[])
             std::filesystem::path out_arg_path;
 
             if (batch_format == "zarr") {
-                // Always make a unique zarr per segmentation:
-                // <resolved-parent>/(<stem-of(-o)>_<seg-name>)
-                std::filesystem::path parent;
-                if (base.is_absolute()) {
-                    parent = base.parent_path();
-                } else if (base.has_parent_path()) {
-                    parent = entry.path() / base.parent_path();
-                } else {
-                    parent = entry.path();
-                }
-                if (parent.empty()) {
-                    parent = entry.path();
-                }
-                std::filesystem::create_directories(parent);
+                // Resolve output relative to the segmentation folder unless -o is absolute.
+                out_arg_path = base.is_absolute() ? base : (entry.path() / base);
 
-                std::string stem = base.filename().string();
-                if (stem.empty()) {
-                    stem = base.stem().string();
+                const auto parent = out_arg_path.parent_path();
+                if (!parent.empty()) {
+                    std::filesystem::create_directories(parent);
                 }
-                if (base.extension() == ".zarr") {
-                    stem = base.stem().string();
-                }
-                out_arg_path = parent / (stem + "_" + seg_name);
             } else {
                 // For TIFF, keep old behavior but handle absolute -o correctly
                 out_arg_path = base.is_absolute() ? (base / seg_name)

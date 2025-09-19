@@ -94,6 +94,7 @@ private:
     QComboBox* collectionComboBox;
     QDoubleSpinBox* angleStepSpinBox;
     QSpinBox* processesSpinBox;
+    QSpinBox* ompThreadsSpinBox;
     QSpinBox* thresholdSpinBox;  // Intensity threshold for peak detection
     QSpinBox* windowSizeSpinBox; // Window size for peak detection
     QSpinBox* maxRadiusSpinBox;  // Max radius for ray casting
@@ -140,5 +141,4 @@ private:
     QList<QPointer<QProcess>> runningProcesses;
     bool jobsRunning;
 };
-
 

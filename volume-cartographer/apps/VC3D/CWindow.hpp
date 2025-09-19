@@ -5,6 +5,7 @@
 
 #include <opencv2/core.hpp>
 #include <QComboBox>
+#include <QCheckBox>
 #include "ui_VCMain.h"
 
 #include "vc/ui/VCCollection.hpp"
@@ -148,6 +149,7 @@ private slots:
     void onZoomIn();
     void onZoomOut();
     void onCopyCoordinates();
+    void onAxisAlignedSlicesToggled(bool enabled);
 
 private:
     bool appInitComplete{false};
@@ -230,6 +232,7 @@ private:
     QDoubleSpinBox* spNorm[3];
     QPushButton* btnZoomIn;
     QPushButton* btnZoomOut;
+    QCheckBox* chkAxisAlignedSlices;
 
 
     Ui_VCMainWindow ui;
@@ -240,6 +243,7 @@ private:
     ChunkCache *chunk_cache;
     std::vector<CVolumeViewer*> _viewers;
     CSurfaceCollection *_surf_col;
+    bool _useAxisAlignedSlices{false};
 
     std::unordered_map<std::string, OpChain*> _opchains;
 
@@ -253,7 +257,9 @@ private:
     QShortcut* fDrawingModeShortcut;
     QShortcut* fCompositeViewShortcut;
     QShortcut* fDirectionHintsShortcut;
+    QShortcut* fAxisAlignedSlicesShortcut;
+
+    void applySlicePlaneOrientation(Surface* sourceOverride = nullptr);
 
 
 };  // class CWindow
-

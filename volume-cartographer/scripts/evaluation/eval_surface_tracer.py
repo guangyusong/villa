@@ -24,16 +24,25 @@ class PatchInfo:
 
 class SurfaceTracerEvaluation:
     
-    def __init__(self, config_path: str):
+    def __init__(self, config_path: str, patch_out_path: Optional[str] = None):
         with open(config_path, 'r') as f:
             self.config = json.load(f)
-        
+
         self.out_dir = Path(self.config["out_path"])
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        self.patches_dir = self.out_dir / "patches"
+
+        patch_path_value = patch_out_path or self.config.get("patch_out_path")
+        if patch_path_value:
+            patch_path = Path(patch_path_value)
+            if not patch_path.is_absolute():
+                patch_path = self.out_dir / patch_path
+            self.patches_dir = patch_path
+        else:
+            self.patches_dir = self.out_dir / "patches"
+
         self.traces_dir = self.out_dir / "traces"
-        self.patches_dir.mkdir(exist_ok=self.config["use_existing_patches"])
-        self.traces_dir.mkdir(exist_ok=True)
+        self.patches_dir.mkdir(parents=True, exist_ok=self.config["use_existing_patches"])
+        self.traces_dir.mkdir(parents=True, exist_ok=True)
 
     def find_seed_points(self) -> List[Tuple[float, float, float]]:
         # Find seed points from existing patches, filtering by z-range and vc_gsfs_mode = explicit_seed
@@ -379,15 +388,38 @@ class SurfaceTracerEvaluation:
             wandb.summary.update(metric_to_mean)
             wandb.finish()
     
-    def run(self):
-        
+    def _collect_existing_patches(self) -> List[Path]:
+        patches = []
+        for patch_dir in self.patches_dir.iterdir():
+            if patch_dir.is_dir() and all((patch_dir / filename).exists() for filename in ["meta.json", "x.tif", "y.tif", "z.tif"]):
+                patches.append(patch_dir)
+        return patches
+
+    def run(self, seeding_only: bool = False, expansion_only: bool = False):
+
         try:
 
+            if seeding_only and expansion_only:
+                raise ValueError("Cannot run in both seeding-only and expansion-only modes")
+
+            if seeding_only:
+                seed_points = self.find_seed_points()
+                if len(seed_points) == 0:
+                    raise RuntimeError("No seed points found for seeding-only mode")
+                seeding_patches = self.run_seeding(seed_points)
+                logger.info(f"Seeding-only mode complete, generated {len(seeding_patches)} patches")
+                return
+
+            if expansion_only:
+                existing_patches = self._collect_existing_patches()
+                if len(existing_patches) == 0:
+                    raise RuntimeError("No existing patches available for expansion-only mode")
+                expansion_patches = self.run_expansion(existing_patches)
+                logger.info(f"Expansion-only mode complete, generated {len(expansion_patches)} new patches")
+                return
+
             if self.config.get("use_existing_patches", False):
-                existing_patches = []
-                for patch_dir in self.patches_dir.iterdir():
-                    if patch_dir.is_dir() and all((patch_dir / filename).exists() for filename in ["meta.json", "x.tif", "y.tif", "z.tif"]):
-                        existing_patches.append(patch_dir)
+                existing_patches = self._collect_existing_patches()
                 logger.info(f"Using {len(existing_patches)} existing patches")
                 all_patches = existing_patches
             else:
@@ -412,9 +444,12 @@ class SurfaceTracerEvaluation:
 
 @click.command()
 @click.argument('config_file', type=click.Path(exists=True))
-def main(config_file: str):
-    test_harness = SurfaceTracerEvaluation(config_file)
-    test_harness.run()
+@click.option('--seeding-only', is_flag=True, help='Only run the seeding stage and exit')
+@click.option('--expansion-only', is_flag=True, help='Only run the expansion stage using existing patches')
+@click.option('--patch-out-path', type=click.Path(), help='Override output directory for patches')
+def main(config_file: str, seeding_only: bool, expansion_only: bool, patch_out_path: Optional[str]):
+    test_harness = SurfaceTracerEvaluation(config_file, patch_out_path=patch_out_path)
+    test_harness.run(seeding_only=seeding_only, expansion_only=expansion_only)
 
 
 if __name__ == '__main__':

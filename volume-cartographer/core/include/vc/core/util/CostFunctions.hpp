@@ -674,7 +674,10 @@ struct NormalConstraintPlane {
     const vc::core::util::NormalGridVolume& normal_grid_volume;
     const int plane_idx; // 0: XY, 1: XZ, 2: YZ
     const double weight;
- 
+    const int z_min;
+    const int z_max;
+    bool invert_dir;
+
      template<typename T>
      struct PointPairCache {
          cv::Point2f p1_ = {-1, -1}, p2_ = {-1, -1};
@@ -717,8 +720,8 @@ struct NormalConstraintPlane {
      const double snap_trig_th_ = 4.0;
      const double snap_search_range_ = 16.0;
  
-     NormalConstraintPlane(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight)
-         : normal_grid_volume(normal_grid_volume), plane_idx(plane_idx), weight(weight) {}
+     NormalConstraintPlane(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight, bool direction_aware = false, int z_min = -1, int z_max = -1, bool invert_dir = false)
+         : normal_grid_volume(normal_grid_volume), plane_idx(plane_idx), weight(weight), direction_aware_(direction_aware), z_min(z_min), z_max(z_max), invert_dir(invert_dir) {}
 
     template <typename T>
     bool operator()(const T* const pA, const T* const pB1, const T* const pB2, const T* const pC, T* residual) const {
@@ -788,7 +791,11 @@ struct NormalConstraintPlane {
         }
 
         // Query the normal grids.
+        //FIXME query in middle!
         cv::Point3f query_point(val(pA[0]), val(pA[1]), val(pA[2]));
+
+        if (z_min != -1 && query_point.z < z_min) return true;
+        if (z_max != -1 && query_point.z > z_max) return true;
 
         // auto grid_query = normal_grid_volume.query(query_point, plane_idx);
         // if (!grid_query) {
@@ -804,7 +811,11 @@ struct NormalConstraintPlane {
         if (!grid)
             return true;
 
-        T interpolated_loss = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid, 0);
+        T interpolated_loss;
+        if (invert_dir)
+            interpolated_loss = calculate_normal_snapping_loss(pE_2d, pA_2d, *grid, 0);
+        else
+            interpolated_loss = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid, 0);
 
         // Calculate angular weight.
         double v_abn[3], v_ac[3];
@@ -898,8 +909,11 @@ struct NormalConstraintPlane {
             return T(0.0);
         }
 
-        T total_weighted_dot_product = T(0.0);
+        T total_weighted_dot_loss = T(0.0);
         T total_weight = T(0.0);
+
+        // T total_weighted_dot_product_n = T(0.0);
+        // T total_weight_n = T(0.0);
 
         for (const auto& path_ptr : nearby_paths) {
             const auto& path = *path_ptr;
@@ -923,17 +937,30 @@ struct NormalConstraintPlane {
                 }
                 cv::Point2f normal(-tangent.y, tangent.x);
 
-                T dot_product = ceres::abs(edge_normal_x * T(normal.x) + edge_normal_y * T(normal.y));
+                T dot_product = edge_normal_x * T(normal.x) + edge_normal_y * T(normal.y);
+                if (!direction_aware_) {
+                    dot_product = ceres::abs(dot_product);
+                }
 
-                total_weighted_dot_product += weight_n * dot_product;
+                total_weighted_dot_loss += weight_n*(T(1.0) - dot_product);
                 total_weight += weight_n;
+                // else {
+                //     if (dot_product >= 0) {
+                //         total_weighted_dot_product += weight_n * dot_product;
+                //         total_weight += weight_n;
+                //     }
+                //     else {
+                //         total_weighted_dot_product_n += weight_n * dot_product;
+                //         total_weight_n += weight_n;
+                //     }
+                // }
+
             }
         }
 
         T normal_loss = T(0.0);
         if (total_weight > T(1e-9)) {
-            T avg_dot_product = total_weighted_dot_product / total_weight;
-            normal_loss = (T(1.0) - avg_dot_product);
+            normal_loss = total_weighted_dot_loss/total_weight;
         }
 
         // Snapping logic
@@ -1088,8 +1115,11 @@ struct NormalConstraintPlane {
         if (use_analytic) {
             return new AnalyticCostFunction(normal_grid_volume, plane_idx, weight);
         }
+    static ceres::CostFunction* Create(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double weight, bool direction_aware = false, int z_min = -1, int z_max = -1, bool invert_dir = false) {
         return new ceres::AutoDiffCostFunction<NormalConstraintPlane, 1, 3, 3, 3, 3>(
-            new NormalConstraintPlane(normal_grid_volume, plane_idx, weight)
+            new NormalConstraintPlane(normal_grid_volume, plane_idx, weight, direction_aware, z_min, z_max, invert_dir)
         );
     }
+
+    bool direction_aware_;
 };

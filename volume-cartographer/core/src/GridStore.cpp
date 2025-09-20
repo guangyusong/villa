@@ -27,7 +27,7 @@ namespace vc::core::util {
 
 namespace {
 constexpr uint32_t GRIDSTORE_MAGIC = 0x56434753; // "VCGS"
-constexpr uint32_t GRIDSTORE_VERSION = 1;
+constexpr uint32_t GRIDSTORE_VERSION = 2;
 
 #if defined(__linux__)
 auto CountOpenFiles() -> std::optional<size_t> {
@@ -126,6 +126,7 @@ void CloseFd(int& fd, const std::string& path, std::string_view context) {
         return;
     }
 }
+constexpr uint32_t GRIDSTORE_VERSION = 2;
 }
 
 struct MmappedData {
@@ -269,10 +270,12 @@ public:
     }
 
     void save(const std::string& path) const {
-        size_t header_size = 11 * sizeof(uint32_t);
+        std::string meta_str = meta_.dump();
+        size_t header_size = 13 * sizeof(uint32_t);
         size_t buckets_size = get_all_buckets_size();
         size_t paths_size = get_all_seglist_size();
-        size_t total_size = header_size + buckets_size + paths_size;
+        size_t meta_size = meta_str.size();
+        size_t total_size = header_size + buckets_size + paths_size + meta_size;
 
         std::vector<char> buffer(total_size);
 
@@ -304,6 +307,8 @@ public:
         uint32_t num_paths = htonl(storage_.size());
         uint32_t buckets_offset = htonl(header_size);
         uint32_t paths_offset = htonl(header_size + buckets_size);
+        uint32_t json_meta_offset = htonl(header_size + buckets_size + paths_size);
+        uint32_t json_meta_size = htonl(meta_size);
 
         memcpy(header_ptr, &magic, sizeof(magic)); header_ptr += sizeof(magic);
         memcpy(header_ptr, &version, sizeof(version)); header_ptr += sizeof(version);
@@ -316,6 +321,8 @@ public:
         memcpy(header_ptr, &num_paths, sizeof(num_paths)); header_ptr += sizeof(num_paths);
         memcpy(header_ptr, &buckets_offset, sizeof(buckets_offset)); header_ptr += sizeof(buckets_offset);
         memcpy(header_ptr, &paths_offset, sizeof(paths_offset)); header_ptr += sizeof(paths_offset);
+        memcpy(header_ptr, &json_meta_offset, sizeof(json_meta_offset)); header_ptr += sizeof(json_meta_offset);
+        memcpy(header_ptr, &json_meta_size, sizeof(json_meta_size)); header_ptr += sizeof(json_meta_size);
 
         // In-line verification
         {
@@ -386,6 +393,10 @@ public:
                 }
             }
         }
+
+        // Write metadata
+        char* meta_start = buffer.data() + header_size + buckets_size + paths_size;
+        memcpy(meta_start, meta_str.data(), meta_size);
 
         // Write buffer to file
         std::ofstream file(path, std::ios::binary);
@@ -463,15 +474,19 @@ public:
         const char* end = current + mmapped_data_->size;
 
         // 1. Read Header
-        size_t header_size = 11 * sizeof(uint32_t);
-        if (mmapped_data_->size < header_size) {
+        size_t min_header_size = 11 * sizeof(uint32_t);
+        if (mmapped_data_->size < min_header_size) {
             throw std::runtime_error("Invalid GridStore file: too small for header.");
         }
         uint32_t magic = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
         uint32_t version = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
-        if (magic != GRIDSTORE_MAGIC || version != GRIDSTORE_VERSION) {
-            throw std::runtime_error("Invalid GridStore file: magic or version mismatch.");
+        if (magic != GRIDSTORE_MAGIC) {
+            throw std::runtime_error("Invalid GridStore file: magic mismatch.");
         }
+        if (version > GRIDSTORE_VERSION) {
+            throw std::runtime_error("GridStore file is a newer version than this reader supports.");
+        }
+
         bounds_.x = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
         bounds_.y = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
         bounds_.width = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
@@ -481,6 +496,16 @@ public:
         uint32_t num_paths = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
         uint32_t buckets_offset = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
         uint32_t paths_offset = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
+
+        uint32_t json_meta_offset = 0;
+        uint32_t json_meta_size = 0;
+        if (version >= 2) {
+            if (mmapped_data_->size < 13 * sizeof(uint32_t)) {
+                throw std::runtime_error("Invalid GridStore v2 file: too small for extended header.");
+            }
+            json_meta_offset = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
+            json_meta_size = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
+        }
 
         grid_size_ = cv::Size(
             (bounds_.width + cell_size_ - 1) / cell_size_,
@@ -517,7 +542,17 @@ public:
                 grid_[i].push_back(offset_to_handle.at(path_offset));
             }
         }
+        // 4. Read Metadata
+        if (version >= 2 && json_meta_size > 0) {
+            const char* meta_start = static_cast<const char*>(mmapped_data_->data) + json_meta_offset;
+            if (meta_start + json_meta_size > end) {
+                throw std::runtime_error("Invalid GridStore file: metadata out of bounds.");
+            }
+            std::string meta_str(meta_start, json_meta_size);
+            meta_ = nlohmann::json::parse(meta_str);
+        }
     }
+    nlohmann::json meta_;
 
 private:
     char* write_bucket(char* current, const std::vector<int>& bucket, const std::unordered_map<int, uint32_t>& path_offsets) const {
@@ -614,6 +649,7 @@ GridStore::GridStore(const cv::Rect& bounds, int cell_size)
 GridStore::GridStore(const std::string& path)
     : pimpl_(std::make_unique<GridStoreImpl>(cv::Rect(), 1)) { // Use a dummy cell_size to avoid division by zero
     pimpl_->load_mmap(path);
+    meta = pimpl_->meta_;
 }
 
 GridStore::~GridStore() = default;
@@ -654,6 +690,7 @@ size_t GridStore::numNonEmptyBuckets() const {
 }
 
 void GridStore::save(const std::string& path) const {
+    pimpl_->meta_ = meta;
     pimpl_->save(path);
 }
 

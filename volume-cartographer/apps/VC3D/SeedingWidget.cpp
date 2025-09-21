@@ -129,7 +129,7 @@ void SeedingWidget::setupUI()
     ompThreadsSpinBox->setToolTip("If greater than 0, prefixes commands with OMP_NUM_THREADS before execution");
     ompLayout->addWidget(ompThreadsSpinBox);
     mainLayout->addLayout(ompLayout);
-    
+
     // Intensity threshold control
     auto thresholdLayout = new QHBoxLayout();
     thresholdLayout->addWidget(new QLabel("Intensity Threshold:", this));
@@ -589,7 +589,7 @@ void SeedingWidget::onRunSegmentationClicked()
     const int numProcesses = processesSpinBox->value();
     const int totalPoints = static_cast<int>(allPoints.size());
     const int ompThreads = ompThreadsSpinBox ? ompThreadsSpinBox->value() : 0;
-    
+
     // Get paths
     std::filesystem::path pathsDir;
     std::filesystem::path seedJsonPath;
@@ -657,7 +657,7 @@ void SeedingWidget::onRunSegmentationClicked()
             env.insert("OMP_NUM_THREADS", QString::number(ompThreads));
         }
         process->setProcessEnvironment(env);
-        
+
         // Connect finished signal
         connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
             [this, process, pointIndex, &completedJobs, &nextPointIndex, &startProcessForPoint, totalPoints]
@@ -1302,7 +1302,7 @@ void SeedingWidget::onExpandSeedsClicked()
     const int numProcesses = processesSpinBox->value();
     const int expansionIterations = expansionIterationsSpinBox->value();
     const int ompThreads = ompThreadsSpinBox ? ompThreadsSpinBox->value() : 0;
-    
+
     // Get paths
     std::filesystem::path pathsDir;
     std::filesystem::path expandJsonPath;
@@ -1362,7 +1362,7 @@ void SeedingWidget::onExpandSeedsClicked()
             env.insert("OMP_NUM_THREADS", QString::number(ompThreads));
         }
         process->setProcessEnvironment(env);
-        
+
         // Connect finished signal
         connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
             [this, process, iterationIndex, &completedJobs, &nextIterationIndex, &startExpansionProcess, expansionIterations]
@@ -1491,3 +1491,7 @@ void SeedingWidget::onSurfacesLoaded()
     // Update button states when surfaces are loaded/reloaded
     updateButtonStates();
 }
+
+
+
+

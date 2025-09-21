@@ -25,20 +25,14 @@
 static float space_trace_dist_w = 1.0;
 float dist_th = 1.5;
 static float normal_loss_w = 1.0;
-static float space_line_loss_w = 0.1f;
 
 // global CUDA to allow use to set to false globally
 // in the case they have cuda avail, but do not want to use it
 static bool g_use_cuda = true;
-static bool g_use_normal_loss_analytic = false;
 
 // Expose a simple toggle for CUDA usage so tools can honor JSON settings
 void set_space_tracing_use_cuda(bool enable) {
     g_use_cuda = enable;
-}
-
-void set_normal_loss_use_analytic(bool enable) {
-    g_use_normal_loss_analytic = enable;
 }
 
 
@@ -370,11 +364,11 @@ static int emptytrace_create_centered_losses(ceres::Problem &problem, const cv::
 
 template <typename T, typename C>
 static int conditional_spaceline_loss(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::Mat_<uint16_t> &loss_status,
-    ceres::Problem &problem, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &loc, Chunked3d<T,C> &t, int steps, float w)
+    ceres::Problem &problem, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &loc, Chunked3d<T,C> &t, int steps)
 {
     int set = 0;
     if (!loss_mask(bit, p, off, loss_status))
-        set = set_loss_mask(bit, p, off, loss_status, gen_space_line_loss(problem, p, off, state, loc, t, steps, w));
+        set = set_loss_mask(bit, p, off, loss_status, gen_space_line_loss(problem, p, off, state, loc, t, steps));
     return set;
 };
 

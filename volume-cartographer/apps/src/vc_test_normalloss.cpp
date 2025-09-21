@@ -1,7 +1,9 @@
+#include <array>
 #include <boost/program_options.hpp>
 #include <ceres/ceres.h>
-#include <iostream>
 #include <filesystem>
+#include <iostream>
+#include <memory>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -213,7 +215,8 @@ int main(int argc, char** argv) {
   for (int plane_idx = 0; plane_idx < 3; ++plane_idx) {
     auto result = ngv.query({(float)seed_point[0], (float)seed_point[1], (float)seed_point[2]}, plane_idx);
     if (result) {
-        for (const auto* grid_ptr : {result->grid1, result->grid2}) {
+        const std::array<std::shared_ptr<const vc::core::util::GridStore>, 2> grids = {result->grid1, result->grid2};
+        for (const auto& grid_ptr : grids) {
             if (grid_ptr) {
                 cv::Mat vis = visualize_normal_grid(*grid_ptr, grid_ptr->size());
                 

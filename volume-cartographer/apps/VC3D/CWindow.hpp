@@ -263,3 +263,4 @@ private:
 
 
 };  // class CWindow
+

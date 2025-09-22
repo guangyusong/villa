@@ -9,8 +9,11 @@
 #include <map>
 #include <algorithm>
 #include <limits>
+#include <cmath>
+#include <optional>
 
 #include <opencv2/imgproc.hpp>
+#include <nlohmann/json.hpp>
 
 
 
@@ -36,8 +39,11 @@ private:
     cv::Vec2f uv_min, uv_max;
     cv::Vec2i grid_size;
     cv::Vec2f scale;
+    cv::Vec2f scale_hint = {-1.0f, -1.0f};
+    std::optional<cv::Vec2f> scale_override;
     
 public:
+    void setScaleOverride(const std::optional<cv::Vec2f>& override_scale) { scale_override = override_scale; }
     bool loadObj(const std::string& filename) {
         std::ifstream file(filename);
         if (!file.is_open()) {
@@ -103,6 +109,7 @@ public:
     }
     
     void determineGridDimensions(float stretch_factor = 1000.0f) {
+        scale_hint = {-1.0f, -1.0f};
         // Find UV bounds from all UVs used in faces
         uv_min = cv::Vec2f(std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
         uv_max = cv::Vec2f(std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest());
@@ -128,28 +135,88 @@ public:
         cv::Vec2i preliminary_grid_size;
         preliminary_grid_size[0] = static_cast<int>(std::ceil(uv_range[0] * stretch_factor)) + 1;
         preliminary_grid_size[1] = static_cast<int>(std::ceil(uv_range[1] * stretch_factor)) + 1;
-        
-        std::cout << "Creating preliminary grid: " << preliminary_grid_size[0] << " x " << preliminary_grid_size[1] << " to measure scale..." << std::endl;
-        
+
+        cv::Vec2i effective_preliminary_size = preliminary_grid_size;
+        cv::Vec2f preliminary_scale_multiplier(1.0f, 1.0f);
+
+        auto apply_size_change = [&](int axis, int new_size) {
+            new_size = std::max(2, new_size);
+            if (new_size == effective_preliminary_size[axis]) {
+                return;
+            }
+            // Track how much each pixel was stretched relative to the original grid
+            preliminary_scale_multiplier[axis] *= static_cast<float>(effective_preliminary_size[axis] - 1) /
+                                                static_cast<float>(new_size - 1);
+            effective_preliminary_size[axis] = new_size;
+        };
+
+        // Limit maximum resolution to keep memory usage reasonable
+        constexpr int kMaxPrelimAxis = 8192;
+        apply_size_change(0, std::min(effective_preliminary_size[0], kMaxPrelimAxis));
+        apply_size_change(1, std::min(effective_preliminary_size[1], kMaxPrelimAxis));
+
+        // Limit total pixel count as a secondary guard
+        constexpr int64_t kMaxPrelimPixels = 16ll * 1024ll * 1024ll; // ~192 MB for Vec3f
+        auto clamp_area = [&]() {
+            while (true) {
+                const int64_t area = static_cast<int64_t>(effective_preliminary_size[0]) *
+                                     static_cast<int64_t>(effective_preliminary_size[1]);
+                if (area <= kMaxPrelimPixels) {
+                    break;
+                }
+                const double shrink = std::sqrt(static_cast<double>(area) /
+                                                static_cast<double>(kMaxPrelimPixels));
+                const int new_width = std::max(2, static_cast<int>(std::floor(effective_preliminary_size[0] / shrink)));
+                const int new_height = std::max(2, static_cast<int>(std::floor(effective_preliminary_size[1] / shrink)));
+                if (new_width == effective_preliminary_size[0] && new_height == effective_preliminary_size[1]) {
+                    break;
+                }
+                apply_size_change(0, new_width);
+                apply_size_change(1, new_height);
+            }
+        };
+        clamp_area();
+
+        if (effective_preliminary_size != preliminary_grid_size) {
+            std::cout << "Creating preliminary grid (clamped): "
+                      << effective_preliminary_size[0] << " x " << effective_preliminary_size[1]
+                      << " to measure scale..." << std::endl;
+            std::cout << "  Decimation factors: " << preliminary_scale_multiplier[0] << ", "
+                      << preliminary_scale_multiplier[1] << std::endl;
+        } else {
+            std::cout << "Creating preliminary grid: " << preliminary_grid_size[0] << " x "
+                      << preliminary_grid_size[1] << " to measure scale..." << std::endl;
+        }
+
         // Temporary scale for preliminary rasterization
         cv::Vec2f temp_scale;
         temp_scale[0] = uv_range[0] * stretch_factor / (preliminary_grid_size[0] - 1);
         temp_scale[1] = uv_range[1] * stretch_factor / (preliminary_grid_size[1] - 1);
-        
+
         // Create preliminary grid
-        cv::Mat_<cv::Vec3f> preliminary_points(preliminary_grid_size[1], preliminary_grid_size[0], cv::Vec3f(-1, -1, -1));
-        
+        cv::Mat_<cv::Vec3f> preliminary_points(effective_preliminary_size[1], effective_preliminary_size[0],
+                                               cv::Vec3f(-1, -1, -1));
+
         // Rasterize with temporary scale
         scale = temp_scale;
-        grid_size = preliminary_grid_size;
+        grid_size = effective_preliminary_size;
         for (const auto& face : faces) {
             rasterizeTriangle(preliminary_points, face);
         }
-        
+
         // Calculate actual scale from preliminary grid
         calculateScaleFromGrid(preliminary_points);
         cv::Vec2f measured_scale = scale;
-        
+
+        if (effective_preliminary_size != preliminary_grid_size) {
+            cv::Vec2f uv_metric_scale = estimateUVScaleFromMesh();
+            if (uv_metric_scale[0] > 0 && uv_metric_scale[1] > 0) {
+                std::cout << "Using UV-derived scale estimate: " << uv_metric_scale[0] << ", "
+                          << uv_metric_scale[1] << std::endl;
+                scale_hint = uv_metric_scale;
+            }
+        }
+
         // Pass 2: Calculate final grid dimensions from measured scale
         // The measured scale tells us the physical distance between adjacent grid points
         // We multiply by stretch_factor to get the number of grid points needed
@@ -188,14 +255,33 @@ public:
         // Always calculate scale from the grid to preserve anisotropic scaling
         calculateScaleFromGrid(*points, mesh_units);
 
+        if (scale_hint[0] > 0 && scale_hint[1] > 0) {
+            scale[0] = scale_hint[0] * mesh_units;
+            scale[1] = scale_hint[1] * mesh_units;
+            std::cout << "Overriding scale from UV estimate: " << scale[0] << ", "
+                      << scale[1] << " micrometers" << std::endl;
+        }
+
         if (step != 1) {
+            if (points->cols <= step || points->rows <= step) {
+                std::cout << "Warning: Step size " << step
+                          << " exceeds preliminary grid resolution; skipping downsampling." << std::endl;
+            } else {
+                cv::Size small = cv::Size(std::max(1, points->cols / step),
+                                          std::max(1, points->rows / step));
+                // crop to nearest multiple
+                const int cropped_width = small.width * step;
+                const int cropped_height = small.height * step;
+                *points = points->operator()(cv::Rect(0, 0, cropped_width, cropped_height));
+                cv::resize(*points, *points, small, 0, 0, cv::INTER_NEAREST);
+                scale /= step;
+            }
+        }
 
-            cv::Size small = cv::Size(points->cols/step, points->rows/step);
-            //crop to nearest multiple
-            *points = points->operator()(cv::Rect(0,0,small.width*step, small.height*step));
-            cv::resize(*points, *points, small, 0, 0, cv::INTER_NEAREST);
-
-            scale /= step;
+        if (scale_override.has_value()) {
+            scale = *scale_override;
+            std::cout << "Applying scale override: " << scale[0] << ", " << scale[1]
+                      << " micrometers" << std::endl;
         }
         
         return new QuadSurface(points, scale);
@@ -258,6 +344,63 @@ public:
         }
         
         std::cout << "Calculated scale factors from grid: " << scale[0] << ", " << scale[1] << " micrometers" << std::endl;
+    }
+
+    cv::Vec2f estimateUVScaleFromMesh() const {
+        const size_t max_samples = 200000;
+        const size_t stride = std::max<size_t>(1, faces.size() / max_samples);
+
+        double sum_u = 0.0;
+        double sum_v = 0.0;
+        size_t count = 0;
+
+        for (size_t idx = 0; idx < faces.size(); idx += stride) {
+            const Face& face = faces[idx];
+
+            if (face.vt[0] < 0 || face.vt[1] < 0 || face.vt[2] < 0) {
+                continue;
+            }
+
+            cv::Vec3f v0 = vertices[face.v[0]].pos;
+            cv::Vec3f v1 = vertices[face.v[1]].pos;
+            cv::Vec3f v2 = vertices[face.v[2]].pos;
+
+            cv::Vec2f uv0 = uvs[face.vt[0]].coord;
+            cv::Vec2f uv1 = uvs[face.vt[1]].coord;
+            cv::Vec2f uv2 = uvs[face.vt[2]].coord;
+
+            cv::Vec2f duv1 = uv1 - uv0;
+            cv::Vec2f duv2 = uv2 - uv0;
+
+            const float det = duv1[0] * duv2[1] - duv2[0] * duv1[1];
+            if (std::fabs(det) < 1e-12f) {
+                continue;
+            }
+
+            const float inv_det = 1.0f / det;
+            cv::Vec3f edge1 = v1 - v0;
+            cv::Vec3f edge2 = v2 - v0;
+
+            cv::Vec3f tangent = (duv2[1] * edge1 - duv1[1] * edge2) * inv_det;
+            cv::Vec3f bitangent = (-duv2[0] * edge1 + duv1[0] * edge2) * inv_det;
+
+            const double t_norm = cv::norm(tangent);
+            const double b_norm = cv::norm(bitangent);
+
+            if (!std::isfinite(t_norm) || !std::isfinite(b_norm)) {
+                continue;
+            }
+
+            sum_u += t_norm;
+            sum_v += b_norm;
+            count++;
+        }
+
+        if (count == 0) {
+            return {-1.0f, -1.0f};
+        }
+
+        return {static_cast<float>(sum_u / count), static_cast<float>(sum_v / count)};
     }
     
 private:
@@ -384,6 +527,25 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    std::optional<cv::Vec2f> desired_scale;
+    std::filesystem::path meta_path = obj_path.parent_path() / "meta.json";
+    if (std::filesystem::exists(meta_path)) {
+        try {
+            std::ifstream meta_file(meta_path);
+            nlohmann::json meta_json;
+            meta_file >> meta_json;
+            if (meta_json.contains("scale") && meta_json["scale"].is_array() && meta_json["scale"].size() == 2) {
+                desired_scale = cv::Vec2f(meta_json["scale"][0].get<float>(),
+                                          meta_json["scale"][1].get<float>());
+                std::cout << "Using scale override from meta.json: "
+                          << (*desired_scale)[0] << ", " << (*desired_scale)[1] << std::endl;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: Failed to read scale override from " << meta_path
+                      << ": " << e.what() << std::endl;
+        }
+    }
+
     std::cout << "Converting OBJ to tifxyz format" << std::endl;
     std::cout << "Input: " << obj_path << std::endl;
     std::cout << "Output: " << output_dir << std::endl;
@@ -392,6 +554,7 @@ int main(int argc, char *argv[])
     std::cout << "Step size: " << step << std::endl;
     
     ObjToTifxyzConverter converter;
+    converter.setScaleOverride(desired_scale);
     
     // Load OBJ file
     if (!converter.loadObj(obj_path.string())) {

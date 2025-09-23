@@ -646,7 +646,7 @@ struct Chunked3dFloatFromUint8
 
     float operator()(double z, double y, double x)
     {
-        return sample_cached({z,y,x});
+        return sample_cached(cv::Vec3d{z, y, x});
     }
 
     passTroughComputor _passthrough;
@@ -719,7 +719,7 @@ struct Chunked3dVec3fFromUint8
 
     cv::Vec3f operator()(double z, double y, double x)
     {
-        return sample_cached({z,y,x});
+        return sample_cached(cv::Vec3d{z, y, x});
     }
 
     passTroughComputor _passthrough_x, _passthrough_y, _passthrough_z;

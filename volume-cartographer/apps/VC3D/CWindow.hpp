@@ -5,6 +5,7 @@
 
 #include <opencv2/core.hpp>
 #include <QComboBox>
+#include <QCheckBox>
 #include "ui_VCMain.h"
 
 #include "vc/ui/VCCollection.hpp"
@@ -63,6 +64,7 @@ public slots:
     void onAddOverlap(const std::string& segmentId);
     void onConvertToObj(const std::string& segmentId);
     void onSlimFlattenAndRender(const std::string& segmentId);
+    void onAWSUpload(const std::string& segmentId);
     void onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed = false);
     void onToggleConsoleOutput();
     void onDeleteSegments(const std::vector<std::string>& segmentIds);
@@ -148,6 +150,8 @@ private slots:
     void onZoomIn();
     void onZoomOut();
     void onCopyCoordinates();
+    void onImportObjAsPatches();
+    void onAxisAlignedSlicesToggled(bool enabled);
 
 private:
     bool appInitComplete{false};
@@ -204,12 +208,14 @@ private:
     QCheckBox* chkFilterPartialReview;
     QCheckBox* chkFilterCurrentOnly;
     QCheckBox* chkFilterHideUnapproved;
+    QCheckBox* chkFilterInspectOnly;
     QComboBox* cmbSegmentationDir;
     
     QCheckBox* _chkApproved;
     QCheckBox* _chkDefective;
     QCheckBox* _chkReviewed;
     QCheckBox* _chkRevisit;
+    QCheckBox* _chkInspect;
     QuadSurface *_surf;
     std::string _surfID;
     
@@ -230,6 +236,7 @@ private:
     QDoubleSpinBox* spNorm[3];
     QPushButton* btnZoomIn;
     QPushButton* btnZoomOut;
+    QCheckBox* chkAxisAlignedSlices;
 
 
     Ui_VCMainWindow ui;
@@ -240,6 +247,7 @@ private:
     ChunkCache *chunk_cache;
     std::vector<CVolumeViewer*> _viewers;
     CSurfaceCollection *_surf_col;
+    bool _useAxisAlignedSlices{false};
 
     std::unordered_map<std::string, OpChain*> _opchains;
 
@@ -253,7 +261,10 @@ private:
     QShortcut* fDrawingModeShortcut;
     QShortcut* fCompositeViewShortcut;
     QShortcut* fDirectionHintsShortcut;
+    QShortcut* fAxisAlignedSlicesShortcut;
 
+    void applySlicePlaneOrientation(Surface* sourceOverride = nullptr);
 
+    QAction* fImportObjAct;
 };  // class CWindow
 

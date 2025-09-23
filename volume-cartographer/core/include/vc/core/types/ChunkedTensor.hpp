@@ -5,6 +5,10 @@
 #include <opencv2/core.hpp>
 #include "z5/dataset.hxx"
 
+#include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
+
 #include "vc/core/util/xtensor_include.hpp"
 #include XTENSORINCLUDE(containers, xtensor.hpp)
 #include XTENSORINCLUDE(containers, xadapt.hpp)
@@ -16,6 +20,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+
+#include "vc/core/util/HashFunctions.hpp"
 
 #ifndef CCI_TLS_MAX // Max number for ChunkedCachedInterpolator
 #define CCI_TLS_MAX 256
@@ -635,22 +641,61 @@ struct Chunked3dFloatFromUint8
 
     float operator()(cv::Vec3d p)
     {
-        // p has zyx ordering!
-        p *= _scale;
-        cv::Vec3i i{lround(p[0]), lround(p[1]), lround(p[2])};
-        uint8_t x = _x(i) ;
-        return float{x} / 255.f;
+        return sample_cached(p);
     }
 
     float operator()(double z, double y, double x)
     {
-        return operator()({z,y,x});
+        return sample_cached({z,y,x});
     }
 
     passTroughComputor _passthrough;
     Chunked3d<uint8_t, passTroughComputor> _x;
     float _scale;
     std::unique_ptr<z5::Dataset> _ds;
+
+private:
+    inline cv::Vec3i to_index(cv::Vec3d p) const
+    {
+        // p has zyx ordering!
+        p *= _scale;
+        return {lround(p[0]), lround(p[1]), lround(p[2])};
+    }
+
+    float sample_cached(cv::Vec3d p)
+    {
+        return sample_cached(to_index(p));
+    }
+
+    float sample_cached(const cv::Vec3i &idx)
+    {
+        {
+            std::shared_lock<std::shared_mutex> lock(_cache_mutex);
+            auto it = _cache.find(idx);
+            if (it != _cache.end())
+                return it->second;
+        }
+
+        float value = fetch(idx);
+
+        {
+            std::unique_lock<std::shared_mutex> lock(_cache_mutex);
+            auto [it, inserted] = _cache.emplace(idx, value);
+            if (!inserted)
+                return it->second;
+        }
+
+        return value;
+    }
+
+    float fetch(const cv::Vec3i &idx)
+    {
+        uint8_t x = _x.safe_at(idx);
+        return float{x} / 255.f;
+    }
+
+    mutable std::unordered_map<cv::Vec3i, float, vec3i_hash> _cache;
+    mutable std::shared_mutex _cache_mutex;
 };
 
 struct Chunked3dVec3fFromUint8
@@ -669,22 +714,61 @@ struct Chunked3dVec3fFromUint8
 
     cv::Vec3f operator()(cv::Vec3d p)
     {
-        // Both p and returned vector have zyx ordering!
-        p *= _scale;
-        cv::Vec3i i{lround(p[0]), lround(p[1]), lround(p[2])};
-        uint8_t x = _x(i) ;
-        uint8_t y = _y(i) ;
-        uint8_t z = _z(i) ;
-        return (cv::Vec3f{z, y, x} - cv::Vec3f{128.f, 128.f, 128.f}) / 127.f;
+        return sample_cached(p);
     }
 
     cv::Vec3f operator()(double z, double y, double x)
     {
-        return operator()({z,y,x});
+        return sample_cached({z,y,x});
     }
 
     passTroughComputor _passthrough_x, _passthrough_y, _passthrough_z;
     Chunked3d<uint8_t, passTroughComputor> _x, _y, _z;
     float _scale;
     std::vector<std::unique_ptr<z5::Dataset>> _dss;
+
+private:
+    inline cv::Vec3i to_index(cv::Vec3d p) const
+    {
+        // p has zyx ordering!
+        p *= _scale;
+        return {lround(p[0]), lround(p[1]), lround(p[2])};
+    }
+
+    cv::Vec3f sample_cached(cv::Vec3d p)
+    {
+        return sample_cached(to_index(p));
+    }
+
+    cv::Vec3f sample_cached(const cv::Vec3i &idx)
+    {
+        {
+            std::shared_lock<std::shared_mutex> lock(_cache_mutex);
+            auto it = _cache.find(idx);
+            if (it != _cache.end())
+                return it->second;
+        }
+
+        cv::Vec3f value = fetch(idx);
+
+        {
+            std::unique_lock<std::shared_mutex> lock(_cache_mutex);
+            auto [it, inserted] = _cache.emplace(idx, value);
+            if (!inserted)
+                return it->second;
+        }
+
+        return value;
+    }
+
+    cv::Vec3f fetch(const cv::Vec3i &idx)
+    {
+        uint8_t x = _x.safe_at(idx);
+        uint8_t y = _y.safe_at(idx);
+        uint8_t z = _z.safe_at(idx);
+        return (cv::Vec3f{float(z), float(y), float(x)} - cv::Vec3f{128.f, 128.f, 128.f}) / 127.f;
+    }
+
+    mutable std::unordered_map<cv::Vec3i, cv::Vec3f, vec3i_hash> _cache;
+    mutable std::shared_mutex _cache_mutex;
 };

@@ -276,18 +276,19 @@ int gen_direction_loss(ceres::Problem &problem, const cv::Vec2i &p, const int of
 
     int count = 0;
     for (auto &field: direction_fields) {
+        float const effective_weight = w * field.residual_weight;
         if (field.direction == "horizontal") {
             if (!loc_valid(state(p_off_horz)))
                 continue;
-            problem.AddResidualBlock(FiberDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), w), nullptr, &loc(p)[0], &loc(p_off_horz)[0]);
+            problem.AddResidualBlock(FiberDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), effective_weight), nullptr, &loc(p)[0], &loc(p_off_horz)[0]);
         } else if (field.direction == "vertical") {
             if (!loc_valid(state(p_off_vert)))
                 continue;
-            problem.AddResidualBlock(FiberDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), w), nullptr, &loc(p)[0], &loc(p_off_vert)[0]);
+            problem.AddResidualBlock(FiberDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), effective_weight), nullptr, &loc(p)[0], &loc(p_off_vert)[0]);
         } else if (field.direction == "normal") {
             if (!loc_valid(state(p_off_horz)) || !loc_valid(state(p_off_vert)))
                 continue;
-            problem.AddResidualBlock(NormalDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), w), nullptr, &loc(p)[0], &loc(p_off_horz)[0], &loc(p_off_vert)[0]);
+            problem.AddResidualBlock(NormalDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), effective_weight), nullptr, &loc(p)[0], &loc(p_off_horz)[0], &loc(p_off_vert)[0]);
         } else {
             assert(false);
         }

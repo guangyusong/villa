@@ -9,6 +9,7 @@ struct DirectionField
     std::string direction;
     std::unique_ptr<Chunked3dVec3fFromUint8> field_ptr;
     std::unique_ptr<Chunked3dFloatFromUint8> weight_ptr;
+    float residual_weight = 1.f;
 };
 
 QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMeta*> &surfs_v, const nlohmann::json &params, float voxelsize = 1.0);

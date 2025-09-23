@@ -107,11 +107,16 @@ static auto load_direction_fields(json const&params, ChunkCache *chunk_cache, st
                 z5::filesystem::handle::Dataset weight_ds_handle(weight_group, std::to_string(ome_scale), ".");
                 maybe_weight_ds = z5::filesystem::openDataset(weight_ds_handle);
             }
+            float const loss_weight = direction_field.contains("loss_weight")
+                ? static_cast<float>(direction_field["loss_weight"].get<double>())
+                : 1.0f;
             std::string const unique_id = std::to_string(std::hash<std::string>{}(dirs_group.path().string() + std::to_string(ome_scale)));
-            direction_fields.emplace_back(
+            direction_fields.emplace_back(DirectionField{
                 direction,
                 std::make_unique<Chunked3dVec3fFromUint8>(std::move(direction_dss), scale_factor, chunk_cache, cache_root, unique_id),
-                maybe_weight_ds ? std::make_unique<Chunked3dFloatFromUint8>(std::move(maybe_weight_ds), scale_factor, chunk_cache, cache_root, unique_id + "_conf") : std::unique_ptr<Chunked3dFloatFromUint8>());
+                maybe_weight_ds ? std::make_unique<Chunked3dFloatFromUint8>(std::move(maybe_weight_ds), scale_factor, chunk_cache, cache_root, unique_id + "_conf") : std::unique_ptr<Chunked3dFloatFromUint8>(),
+                loss_weight
+            });
         }
     }
     return direction_fields;

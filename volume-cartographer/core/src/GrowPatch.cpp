@@ -350,8 +350,8 @@ static int emptytrace_create_centered_losses(ceres::Problem &problem, const cv::
     //     count += gen_space_line_loss(problem, p, {0,1}, state, loc, t, unit);
     //     count += gen_space_line_loss(problem, p, {0,-1}, state, loc, t, unit);
     //
-    //     count += gen_direction_loss(problem, p, 1, state, loc, direction_fields);
-    //     count += gen_direction_loss(problem, p, -1, state, loc, direction_fields);
+         count += gen_direction_loss(problem, p, 1, state, loc, direction_fields);
+         count += gen_direction_loss(problem, p, -1, state, loc, direction_fields);
         //TODO normal_loss currently implies OPTIMIZE_ALL - do physics only for now
         // count += gen_normal_loss(problem, p                  , state, loc, ngv, normal_loss_w);
         // count += gen_normal_loss(problem, p + cv::Vec2i(1,1) , state, loc, ngv, normal_loss_w);
@@ -438,8 +438,8 @@ static int emptytrace_create_missing_centered_losses(ceres::Problem &problem, cv
     //     count += conditional_spaceline_loss(8, p, {0,1}, loss_status, problem, state, loc, t, unit);
     //     count += conditional_spaceline_loss(8, p, {0,-1}, loss_status, problem, state, loc, t, unit);
     //
-    //     count += conditional_direction_loss(9, p, 1, loss_status, problem, state, loc, direction_fields);
-    //     count += conditional_direction_loss(9, p, -1, loss_status, problem, state, loc, direction_fields);
+         count += conditional_direction_loss(9, p, 1, loss_status, problem, state, loc, direction_fields);
+         count += conditional_direction_loss(9, p, -1, loss_status, problem, state, loc, direction_fields);
         count += conditional_normal_loss(10, p                 , loss_status, problem, state, loc, ngv, z_min, z_max);
         count += conditional_normal_loss(10, p + cv::Vec2i(1,1), loss_status, problem, state, loc, ngv, z_min, z_max);
         count += conditional_normal_loss(10, p + cv::Vec2i(0,1), loss_status, problem, state, loc, ngv, z_min, z_max);

@@ -25,6 +25,7 @@
 #include <QTemporaryDir>
 #include <QToolBar>
 #include <QFileInfo>
+
 #include <atomic>
 #include <omp.h>
 #include <opencv2/imgproc.hpp>
@@ -48,7 +49,6 @@
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/DateTime.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/SurfaceVoxelizer.hpp"
@@ -199,14 +199,6 @@ CWindow::CWindow() :
         }
     });
 
-    fAxisAlignedSlicesShortcut = new QShortcut(QKeySequence("Ctrl+J"), this);
-    fAxisAlignedSlicesShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fAxisAlignedSlicesShortcut, &QShortcut::activated, [this]() {
-        if (chkAxisAlignedSlices) {
-            chkAxisAlignedSlices->toggle();
-        }
-    });
-
     appInitComplete = true;
 }
 
@@ -302,7 +294,6 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
     }
 
     onManualPlaneChanged();
-    applySlicePlaneOrientation(_surf_col->surface("segmentation"));
 }
 
 // Create widgets
@@ -540,10 +531,6 @@ void CWindow::CreateWidgets(void)
     chkFilterHideUnapproved = ui.chkFilterHideUnapproved;
     connect(chkFilterHideUnapproved, &QCheckBox::toggled, [this]() { onSegFilterChanged(0); });
 
-
-    chkFilterInspectOnly = ui.chkFilterInspectOnly;
-    connect(chkFilterInspectOnly, &QCheckBox::toggled, [this]() { onSegFilterChanged(0); });
-
     cmbSegmentationDir = ui.cmbSegmentationDir;
     connect(cmbSegmentationDir, &QComboBox::currentIndexChanged, this, &CWindow::onSegmentationDirChanged);
 
@@ -565,10 +552,7 @@ void CWindow::CreateWidgets(void)
     
     connect(btnZoomIn, &QPushButton::clicked, this, &CWindow::onZoomIn);
     connect(btnZoomOut, &QPushButton::clicked, this, &CWindow::onZoomOut);
-
-    chkAxisAlignedSlices = ui.chkAxisAlignedSlices;
-    connect(chkAxisAlignedSlices, &QCheckBox::toggled, this, &CWindow::onAxisAlignedSlicesToggled);
-
+    
     spNorm[0] = ui.dspNX;
     spNorm[1] = ui.dspNY;
     spNorm[2] = ui.dspNZ;
@@ -577,7 +561,6 @@ void CWindow::CreateWidgets(void)
     _chkDefective = ui.chkDefective;
     _chkReviewed = ui.chkReviewed;
     _chkRevisit = ui.chkRevisit;
-    _chkInspect = ui.chkInspect;
     
     for(int i=0;i<3;i++)
         spNorm[i]->setRange(-10,10);
@@ -591,13 +574,11 @@ void CWindow::CreateWidgets(void)
     connect(_chkDefective, &QCheckBox::stateChanged, this, &CWindow::onTagChanged);
     connect(_chkReviewed, &QCheckBox::stateChanged, this, &CWindow::onTagChanged);
     connect(_chkRevisit, &QCheckBox::stateChanged, this, &CWindow::onTagChanged);
-    connect(_chkInspect, &QCheckBox::stateChanged, this, &CWindow::onTagChanged);
 #else
     connect(_chkApproved, &QCheckBox::checkStateChanged, this, &CWindow::onTagChanged);
     connect(_chkDefective, &QCheckBox::checkStateChanged, this, &CWindow::onTagChanged);
     connect(_chkReviewed, &QCheckBox::checkStateChanged, this, &CWindow::onTagChanged);
     connect(_chkRevisit, &QCheckBox::checkStateChanged, this, &CWindow::onTagChanged);
-    connect(_chkInspect, &QCheckBox::checkStateChanged, this, &CWindow::onTagChanged);
 #endif
 
     connect(ui.btnEditMask, &QPushButton::pressed, this, &CWindow::onEditMaskPressed);
@@ -814,8 +795,6 @@ void CWindow::CreateMenus(void)
     fFileMenu->addSeparator();
     fFileMenu->addAction(fSettingsAct);
     fFileMenu->addSeparator();
-    fFileMenu->addAction(fImportObjAct);
-    fFileMenu->addSeparator();
     fFileMenu->addAction(fExitAct);
 
     fEditMenu = new QMenu(tr("&Edit"), this);
@@ -865,7 +844,6 @@ void CWindow::CreateMenus(void)
     menuBar()->addMenu(fActionsMenu);
     menuBar()->addMenu(fSelectionMenu);
     menuBar()->addMenu(fHelpMenu);
-
 }
 
 // Create actions
@@ -929,10 +907,6 @@ void CWindow::CreateActions(void)
         fInpaintTeleaAct->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_I));
     #endif
     connect(fInpaintTeleaAct, &QAction::triggered, this, &CWindow::onInpaintTeleaSelected);
-
-    fImportObjAct = new QAction(tr("Import OBJ as Patch..."), this);
-    connect(fImportObjAct, &QAction::triggered, this, &CWindow::onImportObjAsPatches);
-
 }
 
 void CWindow::UpdateRecentVolpkgActions()
@@ -1296,7 +1270,7 @@ void CWindow::Keybindings(void)
         "5,6: Slice down/up by 10 \n"
         "7,8: Slice down/up by 50 \n"
         "9,0: Slice down/up by 100 \n"
-        "Ctrl+J: Toggle axis-aligned slice planes \n"
+        "Ctrl+G: Go to slice (opens dialog to insert slice index) \n"
         "Ctrl+T: Toggle direction hints (flip_x arrows) \n"
         "T: Segmentation Tool \n"
         "P: Pen Tool \n"
@@ -1384,6 +1358,34 @@ void CWindow::onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf
         //NOTE this comes before the focus poi, so focus is applied by views using these slices
         //FIXME this assumes a single segmentation ... make configurable and cleaner ...
         QuadSurface *segment = dynamic_cast<QuadSurface*>(surf);
+        if (segment) {
+            PlaneSurface *segXZ = dynamic_cast<PlaneSurface*>(_surf_col->surface("seg xz"));
+            PlaneSurface *segYZ = dynamic_cast<PlaneSurface*>(_surf_col->surface("seg yz"));
+            
+            if (!segXZ)
+                segXZ = new PlaneSurface();
+            if (!segYZ)
+                segYZ = new PlaneSurface();
+
+            //FIXME actually properly use ptr
+            auto ptr = segment->pointer();
+            segment->pointTo(ptr, vol_loc, 1.0);
+            
+            cv::Vec3f p2;
+            p2 = segment->coord(ptr, {1,0,0});
+            
+            segXZ->setOrigin(vol_loc);
+            segXZ->setNormal(p2-vol_loc);
+            
+            p2 = segment->coord(ptr, {0,1,0});
+            
+            segYZ->setOrigin(vol_loc);
+            segYZ->setNormal(p2-vol_loc);
+            
+            _surf_col->setSurface("seg xz", segXZ);
+            _surf_col->setSurface("seg yz", segYZ);
+        }
+        
         POI *poi = _surf_col->poi("focus");
         
         if (!poi)
@@ -1394,8 +1396,6 @@ void CWindow::onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf
         poi->n = normal;
         
         _surf_col->setPOI("focus", poi);
-
-        applySlicePlaneOrientation(segment);
 
     }
     else {
@@ -1432,14 +1432,9 @@ static void sync_tag(nlohmann::json &dict, bool checked, std::string name, const
             dict[name]["user"] = username;
         }
         dict[name]["date"] = QDateTime::currentDateTime().toString(Qt::ISODate).toStdString();
-        if (name == "approved")
-            dict["date_last_modified"] = get_surface_time_str();
     }
-    if (!checked && dict.count(name)) {
+    if (!checked && dict.count(name))
         dict.erase(name);
-        if (name == "approved")
-            dict["date_last_modified"] = get_surface_time_str();
-    }
 }
 
 void CWindow::onTagChanged(void)
@@ -1481,10 +1476,9 @@ void CWindow::onTagChanged(void)
             sync_tag(surf->meta->at("tags"), _chkDefective->checkState() == Qt::Checked, "defective", username);
             sync_tag(surf->meta->at("tags"), _chkReviewed->checkState() == Qt::Checked, "reviewed", username);
             sync_tag(surf->meta->at("tags"), _chkRevisit->checkState() == Qt::Checked, "revisit", username);
-            sync_tag(surf->meta->at("tags"), _chkInspect->checkState() == Qt::Checked, "inspect", username);
             surf->save_meta();
         }
-        else if (_chkApproved->checkState() || _chkDefective->checkState() || _chkReviewed->checkState() || _chkRevisit->checkState() || _chkInspect->checkState()) {
+        else if (_chkApproved->checkState() || _chkDefective->checkState() || _chkReviewed->checkState() || _chkRevisit->checkState()) {
             surf->meta->push_back({"tags", nlohmann::json::object()});
             if (_chkApproved->checkState()) {
                 if (!username.empty()) {
@@ -1516,14 +1510,6 @@ void CWindow::onTagChanged(void)
                     surf->meta->at("tags")["revisit"]["user"] = username;
                 } else {
                     surf->meta->at("tags")["revisit"] = nullptr;
-                }
-            }
-            if (_chkInspect->checkState()) {
-                if (!username.empty()) {
-                    surf->meta->at("tags")["inspect"] = nlohmann::json::object();
-                    surf->meta->at("tags")["inspect"]["user"] = username;
-                } else {
-                    surf->meta->at("tags")["inspect"] = nullptr;
                 }
             }
             surf->save_meta();
@@ -1625,7 +1611,6 @@ void CWindow::onSurfaceSelected()
             const QSignalBlocker b2{_chkDefective};
             const QSignalBlocker b3{_chkReviewed};
             const QSignalBlocker b4{_chkRevisit};
-            const QSignalBlocker b5{_chkInspect};
             
             std::cout << "surf " << _surf->path << _surfID <<  _surf->meta << std::endl;
             
@@ -1633,13 +1618,11 @@ void CWindow::onSurfaceSelected()
             _chkDefective->setEnabled(true);
             _chkReviewed->setEnabled(true);
             _chkRevisit->setEnabled(true);
-            _chkInspect->setEnabled(true);
             
             _chkApproved->setCheckState(Qt::Unchecked);
             _chkDefective->setCheckState(Qt::Unchecked);
             _chkReviewed->setCheckState(Qt::Unchecked);
             _chkRevisit->setCheckState(Qt::Unchecked);
-            _chkInspect->setCheckState(Qt::Unchecked);
             if (_surf->meta) {
                 if (_surf->meta->value("tags", nlohmann::json::object_t()).count("approved"))
                     _chkApproved->setCheckState(Qt::Checked);
@@ -1649,22 +1632,17 @@ void CWindow::onSurfaceSelected()
                     _chkReviewed->setCheckState(Qt::Checked);
                 if (_surf->meta->value("tags", nlohmann::json::object_t()).count("revisit"))
                     _chkRevisit->setCheckState(Qt::Checked);
-                if (_surf->meta->value("tags", nlohmann::json::object_t()).count("inspect"))
-                    _chkInspect->setCheckState(Qt::Checked);
             }
             else {
                 _chkApproved->setEnabled(false);
                 _chkDefective->setEnabled(false);
                 _chkReviewed->setEnabled(true);
                 _chkRevisit->setEnabled(true);
-                _chkInspect->setEnabled(true);
             }
         }
     }
     else
         std::cout << "ERROR loading " << _surfID << std::endl;
-
-    applySlicePlaneOrientation(_surf);
 
     // If "Current Segment Only" is checked, refresh the filter to update intersections
     if (chkFilterCurrentOnly && chkFilterCurrentOnly->isChecked()) {
@@ -1691,11 +1669,7 @@ void CWindow::FillSurfaceTree()
         double cost = surfMeta->meta->value("avg_cost", -1.f);
         item->setText(3, QString::number(cost, 'f', 3));
         item->setText(4, QString::number(surfMeta->overlapping_str.size()));
-        QString timestamp;
-        if (surfMeta->meta && surfMeta->meta->contains("date_last_modified")) {
-            timestamp = QString::fromStdString((*surfMeta->meta)["date_last_modified"].get<std::string>());
-        }
-        item->setText(5, timestamp);
+
         UpdateSurfaceTreeIcon(item);
     }
 
@@ -1739,8 +1713,7 @@ void CWindow::onSegFilterChanged(int index)
                            chkFilterNoDefective->isChecked() ||
                            chkFilterPartialReview->isChecked() ||
                            chkFilterCurrentOnly->isChecked() ||
-                               chkFilterHideUnapproved->isChecked() ||
-                               chkFilterInspectOnly->isChecked();
+                           chkFilterHideUnapproved->isChecked();
 
     // Check if point set filter has any checked items
     if (!hasActiveFilters && cmbPointSetFilter->count() > 0) {
@@ -1910,15 +1883,6 @@ void CWindow::onSegFilterChanged(int index)
                     show = show && false;  // Hide segments without metadata when filter is active
                 }
             }
-            if (chkFilterInspectOnly->isChecked()) {
-                auto* surface = surfMeta->surface();
-                if (surface && surface->meta) {
-                    auto tags = surface->meta->value("tags", nlohmann::json::object_t());
-                    show = show && (tags.count("inspect") > 0);
-                } else {
-                    show = show && false;  // Hide segments without metadata when filter is active
-                }
-            }
         }
 
         (*it)->setHidden(!show);
@@ -1943,59 +1907,58 @@ void CWindow::onSegFilterChanged(int index)
     }
 }
 
+
 void CWindow::onEditMaskPressed(void)
 {
     if (!_surf)
         return;
-
+    
     //FIXME if mask already exists just open it!
-
+    
     cv::Mat_<cv::Vec3f> points = _surf->rawPoints();
 
     std::filesystem::path path = _surf->path/"mask.tif";
-
+    
     if (!std::filesystem::exists(path)) {
         cv::Mat_<uint8_t> img;
         cv::Mat_<uint8_t> mask;
         //TODO make this aim for some target size instead of a hardcoded decision
         if (points.cols >= 4000) {
             readInterpolated3D(img, currentVolume->zarrDataset(2), points*0.25, chunk_cache);
-
+            
             mask.create(img.size());
-
+            
             for(int j=0;j<img.rows;j++)
                 for(int i=0;i<img.cols;i++)
                     if (points(j,i)[0] == -1)
                         mask(j,i) = 0;
-                    else
-                        mask(j,i) = 255;
+            else
+                mask(j,i) = 255;
         }
         else
         {
             cv::Mat_<cv::Vec3f> scaled;
             cv::resize(points, scaled, {0,0}, 1/_surf->_scale[0], 1/_surf->_scale[1], cv::INTER_CUBIC);
-
+            
             readInterpolated3D(img, currentVolume->zarrDataset(0), scaled, chunk_cache);
             cv::resize(img, img, {0,0}, 0.25, 0.25, cv::INTER_CUBIC);
-
+            
             mask.create(img.size());
-
+            
             for(int j=0;j<img.rows;j++)
                 for(int i=0;i<img.cols;i++)
                     if (points(j*4*_surf->_scale[1],i*4*_surf->_scale[0])[0] == -1)
                         mask(j,i) = 0;
-                    else
-                        mask(j,i) = 255;
+            else
+                mask(j,i) = 255;
         }
-
+        
         std::vector<cv::Mat> layers = {mask, img};
         imwritemulti(path, layers);
     }
-    (*_surf->meta)["date_last_modified"] = get_surface_time_str();
-    _surf->save_meta();
+    
     QDesktopServices::openUrl(QUrl::fromLocalFile(path.string().c_str()));
 }
-
 
 void CWindow::onRefreshSurfaces()
 {
@@ -2075,12 +2038,6 @@ void CWindow::onSurfaceContextMenuRequested(const QPoint& pos)
         onSlimFlattenAndRender(segmentId);
     });
 
-    // AWS Upload
-    QAction* awsUploadAction = new QAction(tr("Upload artifacts to AWS"), this);
-    connect(awsUploadAction, &QAction::triggered, [this, segmentId]() {
-        onAWSUpload(segmentId);
-    });
-
     // Grow segment from segment action
     QAction* growSegmentAction = new QAction(tr("Run Trace"), this);
     connect(growSegmentAction, &QAction::triggered, [this, segmentId]() {
@@ -2127,7 +2084,6 @@ void CWindow::onSurfaceContextMenuRequested(const QPoint& pos)
     contextMenu.addAction(renderAction);
     contextMenu.addAction(convertToObjAction);
     contextMenu.addAction(slimFlattenAction);
-    contextMenu.addAction(awsUploadAction);
     contextMenu.addSeparator();
     // Telea pipeline (RGB -> inpaint -> back to tifxyz)
     QAction* inpaintTeleaAction = new QAction(tr("Inpaint (Telea) && Rebuild Segment"), this);
@@ -2169,7 +2125,6 @@ void CWindow::onSegmentationDirChanged(int index)
             _chkDefective->setEnabled(false);
             _chkReviewed->setEnabled(false);
             _chkRevisit->setEnabled(false);
-            _chkInspect->setEnabled(false);
         }
         
         // Set the new directory in the VolumePkg
@@ -2413,11 +2368,6 @@ void CWindow::AddSingleSegmentation(const std::string& segId)
         double cost = sm->meta->value("avg_cost", -1.f);
         item->setText(3, QString::number(cost, 'f', 3));
         item->setText(4, QString::number(sm->overlapping_str.size()));
-        QString timestamp;
-        if (sm->meta && sm->meta->contains("date_last_modified")) {
-            timestamp = QString::fromStdString((*sm->meta)["date_last_modified"].get<std::string>());
-        }
-        item->setText(5, timestamp);
         UpdateSurfaceTreeIcon(item);
 
     } catch (const std::exception& e) {
@@ -2445,17 +2395,14 @@ void CWindow::RemoveSingleSegmentation(const std::string& segId)
         const QSignalBlocker b2{_chkDefective};
         const QSignalBlocker b3{_chkReviewed};
         const QSignalBlocker b4{_chkRevisit};
-        const QSignalBlocker b5{_chkInspect};
         _chkApproved->setCheckState(Qt::Unchecked);
         _chkDefective->setCheckState(Qt::Unchecked);
         _chkReviewed->setCheckState(Qt::Unchecked);
         _chkRevisit->setCheckState(Qt::Unchecked);
-        _chkInspect->setCheckState(Qt::Unchecked);
         _chkApproved->setEnabled(false);
         _chkDefective->setEnabled(false);
         _chkReviewed->setEnabled(false);
         _chkRevisit->setEnabled(false);
-        _chkInspect->setEnabled(false);
 
         // Reset window title
         for (auto &viewer : _viewers) {
@@ -2865,8 +2812,6 @@ void CWindow::onFocusPOIChanged(std::string name, POI* poi)
 
         // Force an update of the filter
         onSegFilterChanged(0);
-
-        applySlicePlaneOrientation();
     }
 }
 
@@ -2919,150 +2864,4 @@ void CWindow::onCopyCoordinates()
         QApplication::clipboard()->setText(coords);
         statusBar()->showMessage(tr("Coordinates copied to clipboard: %1").arg(coords), 2000);
     }
-}
-
-void CWindow::onAxisAlignedSlicesToggled(bool enabled)
-{
-    _useAxisAlignedSlices = enabled;
-    applySlicePlaneOrientation();
-}
-
-void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
-{
-    if (!_surf_col) {
-        return;
-    }
-
-    POI *focus = _surf_col->poi("focus");
-    cv::Vec3f origin = focus ? focus->p : cv::Vec3f(0, 0, 0);
-
-    if (_useAxisAlignedSlices) {
-        PlaneSurface *segXZ = dynamic_cast<PlaneSurface*>(_surf_col->surface("seg xz"));
-        PlaneSurface *segYZ = dynamic_cast<PlaneSurface*>(_surf_col->surface("seg yz"));
-
-        if (!segXZ) {
-            segXZ = new PlaneSurface();
-        }
-        if (!segYZ) {
-            segYZ = new PlaneSurface();
-        }
-
-        segXZ->setOrigin(origin);
-        segYZ->setOrigin(origin);
-
-        segXZ->setNormal(cv::Vec3f(0, 1, 0));
-        segYZ->setNormal(cv::Vec3f(1, 0, 0));
-
-        _surf_col->setSurface("seg xz", segXZ);
-        _surf_col->setSurface("seg yz", segYZ);
-        return;
-    } else {
-        auto* segment = dynamic_cast<QuadSurface*>(sourceOverride ? sourceOverride : _surf_col->surface("segmentation"));
-        if (!segment) {
-            return;
-        }
-
-        PlaneSurface *segXZ = dynamic_cast<PlaneSurface*>(_surf_col->surface("seg xz"));
-        PlaneSurface *segYZ = dynamic_cast<PlaneSurface*>(_surf_col->surface("seg yz"));
-
-        if (!segXZ) {
-            segXZ = new PlaneSurface();
-        }
-        if (!segYZ) {
-            segYZ = new PlaneSurface();
-        }
-
-        segXZ->setOrigin(origin);
-        segYZ->setOrigin(origin);
-
-        auto ptr = segment->pointer();
-        segment->pointTo(ptr, origin, 1.0f);
-
-        cv::Vec3f xDir = segment->coord(ptr, {1, 0, 0});
-        cv::Vec3f yDir = segment->coord(ptr, {0, 1, 0});
-        segXZ->setNormal(xDir - origin);
-        segYZ->setNormal(yDir - origin);
-
-        _surf_col->setSurface("seg xz", segXZ);
-        _surf_col->setSurface("seg yz", segYZ);
-        return;
-    }
-}
-void CWindow::onImportObjAsPatches()
-{
-    if (!fVpkg) {
-        QMessageBox::warning(this, tr("Error"), tr("No volume package loaded."));
-        return;
-    }
-
-    QStringList objFiles = QFileDialog::getOpenFileNames(this,
-        tr("Select OBJ Files"),
-        QDir::homePath(),
-        tr("OBJ Files (*.obj);;All Files (*)"));
-
-    if (objFiles.isEmpty()) {
-        return;
-    }
-
-    auto pathsdirfs = std::filesystem::path(fVpkg->getVolpkgDirectory()) / std::filesystem::path(fVpkg->getSegmentationDirectory());
-    QString pathsDir = QString::fromStdString(pathsdirfs.string());
-
-    QStringList successfulIds;
-    QStringList failedFiles;
-
-    for (const QString& objFile : objFiles) {
-        QFileInfo fileInfo(objFile);
-        QString baseName = fileInfo.completeBaseName();
-        QString outputDir = pathsDir + "/" + baseName;
-
-        // Check if exists
-        if (QDir(outputDir).exists()) {
-            if (QMessageBox::question(this, tr("Overwrite?"),
-                tr("'%1' exists. Overwrite?").arg(baseName),
-                QMessageBox::Yes | QMessageBox::No) == QMessageBox::No) {
-                continue;
-            }
-        }
-
-        // Run the tool
-        QProcess process;
-        process.setProcessChannelMode(QProcess::MergedChannels);
-
-        QStringList args;
-        args << objFile << outputDir;
-        args << QString::number(1000.0f)  // stretch_factor
-             << QString::number(1.0f)      // mesh_units
-             << QString::number(20);        // step_size
-
-        QString toolPath = QCoreApplication::applicationDirPath() + "/vc_obj2tifxyz_legacy";
-
-        process.start(toolPath, args);
-
-        if (!process.waitForStarted(5000)) {
-            failedFiles.append(fileInfo.fileName());
-            continue;
-        }
-
-        process.waitForFinished(-1);
-
-        if (process.exitCode() == 0 && process.exitStatus() == QProcess::NormalExit) {
-            successfulIds.append(baseName);
-        } else {
-            failedFiles.append(fileInfo.fileName());
-        }
-    }
-
-    // Only add the specific new surfaces
-    for (const QString& id : successfulIds) {
-        AddSingleSegmentation(id.toStdString());
-    }
-
-    onSegFilterChanged(0);
-
-    QString message = tr("Imported: %1\nFailed: %2").arg(successfulIds.size()).arg(failedFiles.size());
-    if (!failedFiles.isEmpty()) {
-        message += tr("\n\nFailed files:\n%1").arg(failedFiles.join("\n"));
-    }
-
-    QMessageBox::information(this, tr("Import Results"), message);
 }

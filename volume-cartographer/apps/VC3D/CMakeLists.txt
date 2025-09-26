@@ -31,6 +31,12 @@ set(srcs
     ProgressUtil.hpp
     CommandLineToolRunner.cpp
     CommandLineToolRunner.hpp
+    OverlayHandler.cpp
+    OverlayHandler.hpp
+    OverlayBoundingBox3d.cpp
+    OverlayBoundingBox3d.hpp
+    OverlaySegmentationIntersections.cpp
+    OverlaySegmentationIntersections.hpp
     ToolDialogs.cpp
     ToolDialogs.hpp
     ConsoleOutputWidget.cpp

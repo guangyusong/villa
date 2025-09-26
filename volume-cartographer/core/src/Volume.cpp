@@ -94,3 +94,57 @@ z5::Dataset *Volume::zarrDataset(int level) const {
 size_t Volume::numScales() const {
     return zarrDs_.size();
 }
+
+namespace {
+
+std::array<size_t, 3> spatialShapeTail(const std::vector<std::size_t>& shape)
+{
+    if (shape.size() < 3) {
+        return {0, 0, 0};
+    }
+    // Treat the trailing dimensions as X, Y, Z respectively. OME-Zarr arrays
+    // are typically laid out as (..., Z, Y, X) and we only care about the
+    // spatial portion here.
+    return {
+        shape[shape.size() - 1], // X
+        shape[shape.size() - 2], // Y
+        shape[shape.size() - 3]  // Z
+    };
+}
+
+double safeRatio(std::size_t numerator, std::size_t denominator)
+{
+    if (denominator == 0) {
+        return 1.0;
+    }
+    return static_cast<double>(numerator) / static_cast<double>(denominator);
+}
+
+} // namespace
+
+std::array<double, 3> Volume::levelScaleFactors(int level) const
+{
+    std::array<double, 3> factors{1.0, 1.0, 1.0};
+    if (zarrDs_.empty() || level < 0 || level >= static_cast<int>(zarrDs_.size())) {
+        return factors;
+    }
+
+    const auto baseShape = spatialShapeTail(zarrDs_.front()->shape());
+    const auto levelShape = spatialShapeTail(zarrDs_[level]->shape());
+
+    if (baseShape[0] == 0 || baseShape[1] == 0 || baseShape[2] == 0 ||
+        levelShape[0] == 0 || levelShape[1] == 0 || levelShape[2] == 0) {
+        return factors;
+    }
+
+    factors[0] = safeRatio(baseShape[0], levelShape[0]); // X axis downsample factor
+    factors[1] = safeRatio(baseShape[1], levelShape[1]); // Y axis downsample factor
+    factors[2] = safeRatio(baseShape[2], levelShape[2]); // Z axis downsample factor
+    return factors;
+}
+
+std::array<double, 3> Volume::levelTranslations(int level) const
+{
+    (void)level;
+    return {0.0, 0.0, 0.0};
+}

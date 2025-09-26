@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <array>
 #include <z5/dataset.hxx>
 #include <z5/filesystem/handle.hxx>
 
@@ -32,7 +33,9 @@ public:
 
     [[nodiscard]] z5::Dataset *zarrDataset(int level = 0) const;
     [[nodiscard]] size_t numScales() const;
-    
+    [[nodiscard]] std::array<double, 3> levelScaleFactors(int level) const;
+    [[nodiscard]] std::array<double, 3> levelTranslations(int level) const;
+
 protected:
     int _width{0};
     int _height{0};
@@ -43,4 +46,3 @@ protected:
     nlohmann::json zarrGroup_;
     void zarrOpen();
 };
-

@@ -2,14 +2,21 @@
 
 #include <QtWidgets>
 
+#include <array>
+#include <functional>
+#include <optional>
 #include <set>
 #include <unordered_map>
 #include "PathData.hpp"
 #include "vc/ui/VCCollection.hpp"
 #include "COutlinedTextItem.hpp"
+#include "BBoxTypes.hpp"
 #include "CSurfaceCollection.hpp"
 #include "CVolumeViewerView.hpp"
 #include "vc/core/types/Volume.hpp"
+
+class Surface;
+class OverlaySegmentationIntersections;
 
 
 class CVolumeViewer : public QWidget
@@ -51,6 +58,16 @@ public:
     void setResetViewOnSurfaceChange(bool reset);
     bool isCompositeEnabled() const { return _composite_enabled; }
 
+    void setSegmentationOverlay(OverlaySegmentationIntersections* overlay) { _segmentationOverlay = overlay; }
+    OverlaySegmentationIntersections* segmentationOverlay() const { return _segmentationOverlay; }
+
+    Surface* surface() const { return _surf; }
+    QGraphicsScene* scene() const { return fScene; }
+    QRect currentImageArea() const { return curr_img_area; }
+    std::shared_ptr<Volume> currentVolume() const { return volume; }
+    CSurfaceCollection* surfaceCollection() const { return _surf_col; }
+    float scale() const { return _scale; }
+
     // Direction hints toggle
     void setShowDirectionHints(bool on) { _showDirectionHints = on; updateAllOverlays(); }
     bool isShowDirectionHints() const { return _showDirectionHints; }
@@ -80,7 +97,10 @@ public:
     auto selections() const -> std::vector<std::pair<QRectF, QColor>>;
     void clearSelections();
     void updateSelectionGraphics();
-    
+    void setBBoxCallbacks(std::function<void(const OrientedBBox&, bool)> onUpdate,
+                          std::function<std::optional<OrientedBBox>()> sharedRequest);
+    void setExternalBBox(const std::optional<OrientedBBox>& bbox);
+
     CVolumeViewerView* fGraphicsView;
 
 public slots:
@@ -185,9 +205,7 @@ protected:
     bool _slice_vis_valid = false;
     std::vector<QGraphicsItem*> slice_vis_items; 
     
-    std::set<std::string> _intersect_tgts = {"visible_segmentation"};
-    std::unordered_map<std::string,std::vector<QGraphicsItem*>> _intersect_items;
-    Intersection *_ignore_intersect_change = nullptr;
+    OverlaySegmentationIntersections* _segmentationOverlay = nullptr;
     
     CSurfaceCollection *_surf_col = nullptr;
     
@@ -228,8 +246,56 @@ protected:
     QGraphicsRectItem* _bboxRectItem = nullptr;
     struct Selection { QRectF surfRect; QColor color; QGraphicsRectItem* item; };
     std::vector<Selection> _selections;
+    std::function<void(const OrientedBBox&, bool)> _bboxSharedUpdate;
+    std::function<std::optional<OrientedBBox>()> _bboxSharedRequest;
+    std::optional<OrientedBBox> _bboxSharedBox;
+    QGraphicsPolygonItem* _bbox3DPolygon = nullptr;
+    std::array<QGraphicsEllipseItem*,4> _bbox3DHandles{};
+    std::array<QPointF,4> _bbox3DHandleCenters{};
+    QGraphicsEllipseItem* _bboxRotationHandle = nullptr;
+    QPointF _bboxRotationHandleCenter{};
+    enum class BBoxDragMode { None, Create, Axis0Min, Axis0Max, Axis1Min, Axis1Max, Translate, Rotate };
+    BBoxDragMode _bboxDragMode3D = BBoxDragMode::None;
+    cv::Vec3f _bboxDragStartVol = {0,0,0};
+    OrientedBBox _bboxDragInitialBox{};
+    float _bboxRotationStartAngle = 0.0f;
+    bool _bboxRotationAngleValid = false;
+    std::array<int,2> _bboxHandleAxisOrder{{0,1}};
 
     bool _useFastInterpolation;
 
+private:
+    struct BBoxAxes {
+        int axisPrimary{-1};
+        int axisSecondary{-1};
+        int axisNormal{-1};
+        bool valid() const { return axisPrimary >= 0 && axisSecondary >= 0 && axisNormal >= 0; }
+    };
+
+    std::optional<BBoxAxes> bboxAxes() const;
+    void updateBBoxOverlay3D();
+    void clearBBoxOverlay3D();
+    bool handleBBoxPlaneMousePress(QPointF scene_loc, Qt::MouseButton button);
+    bool handleBBoxPlaneMouseMove(QPointF scene_loc, Qt::MouseButtons buttons);
+    bool handleBBoxPlaneMouseRelease(QPointF scene_loc, Qt::MouseButton button);
+    static Rect3D normalizeRect(const Rect3D& rect);
+    float axisUpperBound(int axis) const;
+    cv::Vec3f buildPointForAxes(const BBoxAxes& axes, float primary, float secondary, float normal) const;
+    bool isBBoxPlaneView() const;
+    void updateBBoxCursor(const QPointF& scene_loc);
+    cv::Vec3f planeUnitVector(int axis) const;
+    OrientedBBox defaultBBoxFromPoints(const cv::Vec3f& a, const cv::Vec3f& b, const BBoxAxes& axes) const;
+    void ensureBBoxHandles();
+    void syncOverlayToBox(const OrientedBBox& box);
+    void refreshRotationHandle(const std::array<QPointF,4>& cornersScene,
+                               const OrientedBBox& box,
+                               int secondaryAxisIndex);
+    std::array<QPointF,4> bboxSceneCorners(const OrientedBBox& box,
+                                           const cv::Vec3f& axisA, float extentA,
+                                           const cv::Vec3f& axisB, float extentB) const;
+    bool bboxIntersectsCurrentPlane(const OrientedBBox& box) const;
+    bool clampBBoxToVolume(OrientedBBox& box) const;
+    bool projectSceneToVolume(const QPointF& scene_loc, cv::Vec3f& out) const;
+    bool pickRotationHandle(const QPointF& scene_loc) const;
 
 };  // class CVolumeViewer

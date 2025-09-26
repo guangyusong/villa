@@ -25,6 +25,7 @@
 #include <QTemporaryDir>
 #include <QToolBar>
 #include <QFileInfo>
+#include <algorithm>
 #include <atomic>
 #include <omp.h>
 #include <opencv2/imgproc.hpp>
@@ -53,6 +54,11 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/SurfaceVoxelizer.hpp"
 #include "vc/core/util/Render.hpp"
+#include "z5/factory.hxx"
+#include "z5/attributes.hxx"
+#include "z5/filesystem/handle.hxx"
+#include "z5/multiarray/xtensor_access.hxx"
+#include <nlohmann/json.hpp>
 
 
 
@@ -79,6 +85,7 @@ CWindow::CWindow() :
     std::cout << "chunk cache size is " << CHUNK_CACHE_SIZE_GB << " gigabytes " << std::endl;
     
     _surf_col = new CSurfaceCollection();
+    _overlayHandler = std::make_unique<OverlayHandler>(*this, chunk_cache);
     
     //_surf_col->setSurface("manual plane", new PlaneSurface({2000,2000,2000},{1,1,1}));
     _surf_col->setSurface("xy plane", new PlaneSurface({2000,2000,2000},{0,0,1}));
@@ -251,6 +258,11 @@ CVolumeViewer *CWindow::newConnectedCVolumeViewer(std::string surfaceName, QStri
     QSettings settings("VC.ini", QSettings::IniFormat);
     bool resetViewOnSurfaceChange = settings.value("viewer/reset_view_on_surface_change", true).toBool();
     volView->setResetViewOnSurfaceChange(resetViewOnSurfaceChange);
+
+
+    if (_overlayHandler) {
+        _overlayHandler->registerViewer(volView);
+    }
 
 
     volView->setSurface(surfaceName);
@@ -724,14 +736,8 @@ void CWindow::CreateWidgets(void)
 
 void CWindow::onDrawBBoxToggled(bool enabled)
 {
-    // Toggle bbox mode on the segmentation viewer
-    for (auto* viewer : _viewers) {
-        if (viewer->surfName() == "segmentation") {
-            viewer->setBBoxMode(enabled);
-            statusBar()->showMessage(enabled ? tr("BBox mode active: drag on Surface view")
-                                             : tr("BBox mode off"), 3000);
-            break;
-        }
+    if (_overlayHandler) {
+        _overlayHandler->bbox().setEnabled(enabled);
     }
 }
 void CWindow::onSurfaceFromSelection()
@@ -793,7 +799,19 @@ void CWindow::onSelectionClear()
     for (auto* v : _viewers) if (v->surfName() == "segmentation") { segViewer = v; break; }
     if (!segViewer) { statusBar()->showMessage(tr("No Surface viewer found"), 3000); return; }
     segViewer->clearSelections();
+    if (_overlayHandler) {
+        _overlayHandler->bbox().clearBBox();
+    }
     statusBar()->showMessage(tr("Selections cleared"), 2000);
+}
+
+void CWindow::onCutOutBBox()
+{
+    if (!_overlayHandler) {
+        statusBar()->showMessage(tr("BBox overlay unavailable"), 2000);
+        return;
+    }
+    _overlayHandler->bbox().showCutOutDialog(this);
 }
 
 // Create menus
@@ -846,6 +864,7 @@ void CWindow::CreateMenus(void)
 
     fSelectionMenu = new QMenu(tr("&Selection"), this);
     fSelectionMenu->addAction(fSelectionSurfaceFromAct);
+    fSelectionMenu->addAction(fSelectionCutOutAct);
     fSelectionMenu->addAction(fSelectionClearAct);
 
     // Add Telea pipeline to menus
@@ -920,6 +939,8 @@ void CWindow::CreateActions(void)
     // Selection menu actions
     fSelectionSurfaceFromAct = new QAction(tr("Surface from Selection"), this);
     connect(fSelectionSurfaceFromAct, &QAction::triggered, this, &CWindow::onSurfaceFromSelection);
+    fSelectionCutOutAct = new QAction(tr("Cut Out BBox..."), this);
+    connect(fSelectionCutOutAct, &QAction::triggered, this, &CWindow::onCutOutBBox);
     fSelectionClearAct = new QAction(tr("Clear"), this);
     connect(fSelectionClearAct, &QAction::triggered, this, &CWindow::onSelectionClear);
 
@@ -1136,6 +1157,9 @@ void CWindow::OpenVolume(const QString& path)
 
     fVpkgPath = aVpkgPath;
     setVolume(fVpkg->volume());
+    if (_overlayHandler) {
+        _overlayHandler->setVolumePackage(fVpkg);
+    }
     {
         const QSignalBlocker blocker{volSelect};
         volSelect->clear();
@@ -1192,6 +1216,10 @@ void CWindow::CloseVolume(void)
 {
     // Notify viewers to clear their surface pointers before we delete them
     emit sendVolumeClosing();
+
+    if (_overlayHandler) {
+        _overlayHandler->clearVolume();
+    }
 
     // Clear surface collection first
     _surf_col->setSurface("segmentation", nullptr, true);

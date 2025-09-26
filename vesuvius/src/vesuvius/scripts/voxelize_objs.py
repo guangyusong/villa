@@ -97,13 +97,13 @@ def _transform_normals_batch(normals, linear, perm, inv_transpose=None):
     if inv_transpose is None:
         try:
             inv_transpose = np.linalg.inv(linear).T
-        except np.linalg.LinAlgError:
-            inv_transpose = None
+        except np.linalg.LinAlgError as exc:
+            raise ValueError("Affine transform is singular; cannot transform normals.") from exc
 
-    if inv_transpose is not None:
-        transformed_ord = normals_ord @ inv_transpose.T
-    else:
-        transformed_ord = normals_ord @ linear.T
+    if inv_transpose is None:
+        raise ValueError("Affine transform is singular; cannot transform normals.")
+
+    transformed_ord = normals_ord @ inv_transpose.T
 
     lengths = np.linalg.norm(transformed_ord, axis=1)
     nonzero = lengths > 0
@@ -1252,7 +1252,8 @@ def main():
         try:
             inv_transpose = np.linalg.inv(linear_part).T
         except np.linalg.LinAlgError:
-            inv_transpose = None
+            print("ERROR: Provided affine transform is singular; normals cannot be transformed.")
+            sys.exit(1)
 
         transform_info = {
             "matrix": transform_matrix,

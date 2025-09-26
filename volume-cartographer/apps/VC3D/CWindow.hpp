@@ -4,6 +4,8 @@
 #include <cstdint>
 
 #include <opencv2/core.hpp>
+#include <filesystem>
+#include <memory>
 #include <QComboBox>
 #include <QCheckBox>
 #include "ui_VCMain.h"
@@ -16,6 +18,7 @@
 #include "CSurfaceCollection.hpp"
 #include "CVolumeViewer.hpp"
 #include "DrawingWidget.hpp"
+#include "OverlayHandler.hpp"
 #include "OpChain.hpp"
 #include "OpsList.hpp"
 #include "OpsSettings.hpp"
@@ -79,6 +82,7 @@ public:
     // Helper method to get the current volume path
     QString getCurrentVolumePath() const;
     VCCollection* pointCollection() { return _point_collection; }
+    CSurfaceCollection* surfaceCollection() const { return _surf_col; }
 
 protected:
     void keyPressEvent(QKeyEvent* event) override;
@@ -153,6 +157,7 @@ private slots:
     void onCopyCoordinates();
     void onImportObjAsPatches();
     void onAxisAlignedSlicesToggled(bool enabled);
+    void onCutOutBBox();
 
 private:
     bool appInitComplete{false};
@@ -189,6 +194,7 @@ private:
     QAction* fVoxelizePathsAct;
     QAction* fDrawBBoxAct;
     QAction* fSelectionSurfaceFromAct;
+    QAction* fSelectionCutOutAct;
     QAction* fSelectionClearAct;
     QAction* fInpaintTeleaAct = nullptr;
 
@@ -254,6 +260,7 @@ private:
 
     // runner for command line tools 
     CommandLineToolRunner* _cmdRunner;
+    std::unique_ptr<OverlayHandler> _overlayHandler;
     
     // Keyboard shortcuts
     QShortcut* fReviewedShortcut;
@@ -268,4 +275,3 @@ private:
 
     QAction* fImportObjAct;
 };  // class CWindow
-

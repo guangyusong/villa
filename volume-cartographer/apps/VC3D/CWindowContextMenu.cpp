@@ -281,6 +281,19 @@ void CWindow::onSlimFlatten(const std::string& segmentId)
             statusBar()->showMessage(tr("SLIM-flatten failed"), 5000);
             return;
         }
+        // If flatboi produced bad-region JSON, copy it next to the new tifxyz
+        const QString badJson = QDir(segDir).filePath(QString::fromStdString(segmentId) + "_flatboi_bad.json");
+        if (QFileInfo::exists(badJson)) {
+            QDir outDir(outTifxyz);
+            if (!outDir.exists()) outDir.mkpath(".");
+            const QString dst = outDir.filePath("repulsion_sites.json");
+            QFile::remove(dst); // overwrite if present
+            if (QFile::copy(badJson, dst)) {
+                std::cout << "Copied bad-region JSON to: " << dst.toStdString() << std::endl;
+            } else {
+                std::cerr << "Warning: failed to copy bad-region JSON to: " << dst.toStdString() << std::endl;
+            }
+        }
     }
 
     // 4) render the *_flatboi folder

@@ -1190,3 +1190,32 @@ private:
 public:
     bool dbg_ = false;
 };
+
+// -----------------------------
+// Soft repulsion from a 3D center point (smooth "do-not-enter" zone)
+// r(p) = w * exp( - ||p - c||^2 / (2*sigma^2) )
+// -----------------------------
+struct GaussianRepulsionLoss {
+    GaussianRepulsionLoss(const cv::Vec3f& center, float sigma, float w)
+        : c_(center), inv_two_sigma2_( (sigma>1e-9f) ? (1.0f / (2.0f*sigma*sigma)) : 5.0f ), w_(w) {}
+
+    template <typename T>
+    bool operator()(const T* const p, T* residual) const {
+        T dx = p[0] - T(c_[0]);
+        T dy = p[1] - T(c_[1]);
+        T dz = p[2] - T(c_[2]);
+        T sq = dx*dx + dy*dy + dz*dz;
+        residual[0] = T(w_) * ceres::exp( - T(inv_two_sigma2_) * sq );
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const cv::Vec3f& center, float sigma, float w){
+        return new ceres::AutoDiffCostFunction<GaussianRepulsionLoss, 1, 3>(
+            new GaussianRepulsionLoss(center, sigma, w));
+    }
+
+private:
+    cv::Vec3f c_;
+    float inv_two_sigma2_;
+    float w_;
+};

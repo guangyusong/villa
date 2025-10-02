@@ -14,8 +14,8 @@
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/CostFunctions.hpp"
 #include "vc/core/util/HashFunctions.hpp"
-#include "vc/core/util/NormalGridVolume.hpp"
 
+#include <nlohmann/json.hpp>
 #include "vc/core/util/xtensor_include.hpp"
 #include XTENSORINCLUDE(views, xview.hpp)
 
@@ -171,9 +171,83 @@ private:
     std::vector<CorrectionCollection> collections_;
 };
 
+// --- Repulsion sites (loaded from flatboi_bad.json) ---
+class RepulsionSites {
+public:
+    struct Site {
+        cv::Vec3f center3d;
+        cv::Vec2f grid_loc;  // computed via pointer() -> loc_raw()
+        float sigma = 4.0f;
+        float weight = 1.0f;   // per-site multiplier
+    };
+
+    bool load_json(const std::string& path) {
+        try {
+            std::ifstream is(path);
+            if(!is) return false;
+            nlohmann::json j; is >> j;
+            sites_raw_.clear();
+            // Prefer cluster centers; fallback to per-triangle centroids
+            if (j.contains("clusters") && j["clusters"].is_array()) {
+                for (const auto& c : j["clusters"]) {
+                    if (!c.contains("center3d")) continue;
+                    const auto& v = c["center3d"];
+                    Site s;
+                    s.center3d = cv::Vec3f( (float)v[0], (float)v[1], (float)v[2] );
+                    s.weight   = c.value("count", 1);
+                    s.sigma    = c.value("radius", 4.0);
+                    sites_raw_.push_back(s);
+                }
+            }
+            if (sites_raw_.empty() && j.contains("triangles") && j["triangles"].is_array()) {
+                for (const auto& t : j["triangles"]) {
+                    const auto& v = t["centroid3d"];
+                    Site s;
+                    s.center3d = cv::Vec3f( (float)v[0], (float)v[1], (float)v[2] );
+                    const auto& m = t["metrics"];
+                    const float linf  = m.value("linf", 0.0);
+                    const float kappa = m.value("kappa", 1.0);
+                    const float l2    = m.value("l2", 1.0);
+                    const float la    = std::abs(m.value("logA", 0.0));
+                    // crude composite severity
+                    s.weight = std::max({ linf/3.0f, kappa/4.0f, l2/1.7f, la/0.7f });
+                    s.sigma  = 4.0f;
+                    sites_raw_.push_back(s);
+                }
+            }
+            valid_ = !sites_raw_.empty();
+        } catch(...) { valid_ = false; }
+        return valid_;
+    }
+
+    void init_grid_locs(const cv::Mat_<cv::Vec3f>& points) {
+        if (!valid_ || points.empty()) { valid_ = false; return; }
+        QuadSurface tmp(points, {1.0f, 1.0f});
+        sites_.clear(); sites_.reserve(sites_raw_.size());
+        for (auto s : sites_raw_) {
+            cv::Vec3f ptr = tmp.pointer();
+            float d = tmp.pointTo(ptr, s.center3d, 100.0f, 0);
+            (void)d;
+            cv::Vec3f loc3 = tmp.loc_raw(ptr);
+            s.grid_loc = cv::Vec2f(loc3[0], loc3[1]);
+            sites_.push_back(s);
+        }
+        valid_ = !sites_.empty();
+    }
+
+    bool isValid() const { return valid_; }
+    const std::vector<Site>& sites() const { return sites_; }
+
+private:
+    bool valid_ = false;
+    std::vector<Site> sites_raw_;
+    std::vector<Site> sites_;
+};
+
 struct TraceData {
     TraceData(const std::vector<DirectionField> &direction_fields) : direction_fields(direction_fields) {};
     PointCorrection point_correction;
+    RepulsionSites repulsion_sites;
     const vc::core::util::NormalGridVolume *ngv = nullptr;
     const std::vector<DirectionField> &direction_fields;
 };
@@ -190,6 +264,7 @@ enum LossType {
     DIRECTION,
     SNAP,
     NORMAL,
+    REPEL,
     COUNT
 };
 
@@ -203,6 +278,7 @@ struct LossSettings {
         w[LossType::STRAIGHT] = 0.2f;
         w[LossType::DIST] = 1.0f;
         w[LossType::DIRECTION] = 1.0f;
+        w[LossType::REPEL] = 0.25f;
     }
 
     float operator()(LossType type, const cv::Vec2i& p) const {
@@ -218,6 +294,10 @@ struct LossSettings {
 
     int z_min = -1;
     int z_max = std::numeric_limits<int>::max();
+    // Extra knobs for repulsion
+    float repel_sigma = 4.0f;          // in volume units (voxels)
+    float repel_grid_radius = 6.0f;    // in patch grid cells
+    int   repel_max_per_quad = 3;      // cap residuals per quad
 };
 
 static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& params)
@@ -320,6 +400,14 @@ static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TracePar
 static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, TraceParameters &params, const LossSettings &settings);
 
+// --- forward declarations for loss-mask helpers used before their definitions ---
+static bool loss_mask(int bit,
+                      const cv::Vec2i &p,
+                      const cv::Vec2i &off,
+                      cv::Mat_<uint16_t> &loss_status);
+static int set_loss_mask(int bit, const cv::Vec2i &p, const cv::Vec2i &off,
+                         cv::Mat_<uint16_t> &loss_status, int set);
+
 static bool loc_valid(int state)
 {
     return state & STATE_LOC_VALID;
@@ -364,6 +452,69 @@ static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::
     problem.AddResidualBlock(DistLoss::Create(params.unit*cv::norm(off),settings(LossType::DIST, p)), nullptr, &params.dpoints(p)[0], &params.dpoints(p+off)[0]);
 
     return 1;
+}
+
+// Repulsion: add Gaussian repulsion around quad corners near repulsion sites
+static int gen_repulsion_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<uint8_t> &state,
+                              cv::Mat_<cv::Vec3d> &dpoints, const TraceData& trace_data,
+                              const LossSettings& settings)
+{
+    if (!trace_data.repulsion_sites.isValid()) return 0;
+
+    // This quad's integer location (col=x, row=y)
+    cv::Vec2f q((float)p[1], (float)p[0]);
+    const float r2 = settings.repel_grid_radius * settings.repel_grid_radius;
+
+    // Choose a few nearest sites
+    struct Cand { int idx; float w; };
+    std::vector<Cand> cands; cands.reserve(8);
+    const auto& sites = trace_data.repulsion_sites.sites();
+    for (int i=0;i<(int)sites.size();++i){
+        cv::Vec2f d = sites[i].grid_loc - q;
+        float d2 = d[0]*d[0] + d[1]*d[1];
+        if (d2 <= r2) {
+            // distance-weighted site weight
+            float inv = std::max(1e-3f, d2);
+            float w   = sites[i].weight / inv;
+            cands.push_back({i,w});
+        }
+    }
+    if (cands.empty()) return 0;
+
+    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b){ return a.w>b.w; });
+    if((int)cands.size() > settings.repel_max_per_quad) cands.resize(settings.repel_max_per_quad);
+
+    auto add = [&](const cv::Vec2i& pp)->int{
+        if (!coord_valid(state(pp))) return 0;
+        int added=0;
+        for (const auto& c : cands){
+            const auto& s = sites[c.idx];
+            float w = settings.w[LossType::REPEL] * std::max(0.25f, s.weight);
+            problem.AddResidualBlock(GaussianRepulsionLoss::Create(s.center3d, std::max(s.sigma, settings.repel_sigma), w),
+                                     nullptr, &dpoints(pp)[0]);
+            ++added;
+        }
+        return added;
+    };
+
+    int cnt=0;
+    cnt += add(p);
+    cnt += add(p + cv::Vec2i(0,1));
+    cnt += add(p + cv::Vec2i(1,0));
+    cnt += add(p + cv::Vec2i(1,1));
+    return cnt;
+}
+
+static int conditional_repulsion_loss(int bit, const cv::Vec2i& p, cv::Mat_<uint16_t>& loss_status,
+                                      ceres::Problem& problem, cv::Mat_<uint8_t>& state,
+                                      cv::Mat_<cv::Vec3d>& dpoints, const TraceData& trace_data,
+                                      const LossSettings& settings)
+{
+    int set=0;
+    if (!loss_mask(bit, p, {0,0}, loss_status))
+        set = set_loss_mask(bit, p, {0,0}, loss_status,
+                            gen_repulsion_loss(problem, p, state, dpoints, trace_data, settings));
+    return set;
 }
 
 static cv::Vec2i lower_p(const cv::Vec2i &point, const cv::Vec2i &offset)
@@ -754,6 +905,9 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_corr_loss(11, p + cv::Vec2i( 0,-1), loss_status, problem, params.state, params.dpoints, trace_data);
     count += conditional_corr_loss(11, p + cv::Vec2i(-1, 0), loss_status, problem, params.state, params.dpoints, trace_data);
 
+    // repulsion (auto from flatboi)
+    count += conditional_repulsion_loss(12, p, loss_status, problem, params.state, params.dpoints, trace_data, settings);
+
     return count;
 }
 
@@ -950,6 +1104,11 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     int rewind_gen = params.value("rewind_gen", -1);
     loss_settings.z_min = params.value("z_min", -1);
     loss_settings.z_max = params.value("z_max", std::numeric_limits<int>::max());
+    // Repulsion knobs
+    loss_settings.w[LossType::REPEL] = params.value("repel_weight", loss_settings.w[LossType::REPEL]);
+    loss_settings.repel_sigma        = params.value("repel_sigma",  loss_settings.repel_sigma);
+    loss_settings.repel_grid_radius  = params.value("repel_grid_radius", loss_settings.repel_grid_radius);
+    loss_settings.repel_max_per_quad = params.value("repel_max_per_quad", loss_settings.repel_max_per_quad);
     ALifeTime f_timer("empty space tracing\n");
     // DSReader reader = {ds,scale,cache};
     std::unique_ptr<vc::core::util::NormalGridVolume> ngv;
@@ -960,6 +1119,41 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         }
     }
     trace_data.ngv = ngv.get();
+
+    // Repulsion sites auto-discovery: no per-trace parameter needed.
+    {
+        std::optional<std::string> repulsion_path;
+        // 1) explicit JSON parameter still supported (non-breaking)
+        if (params.contains("repulsion_sites_path")) {
+            repulsion_path = params["repulsion_sites_path"].get<std::string>();
+        }
+        // 2) try next to the normal grid volume (common repo layout)
+        if (!repulsion_path && params.contains("normal_grid_path")) {
+            try {
+                namespace fs = std::filesystem;
+                fs::path base = fs::path(params["normal_grid_path"].get<std::string>()).parent_path();
+                for (auto cand : { "flatboi_bad.json", "repulsion_sites.json" }) {
+                    fs::path p = base / cand;
+                    if (fs::exists(p)) { repulsion_path = p.string(); break; }
+                }
+            } catch(...) { /* ignore */ }
+        }
+        // 3) environment override (cluster/job setup)
+        if (!repulsion_path) {
+            if (const char* e = std::getenv("VC_REPULSION_SITES")) {
+                if (*e) repulsion_path = std::string(e);
+            }
+        }
+        // Load if found; otherwise repulsion remains disabled
+        if (repulsion_path && !repulsion_path->empty()) {
+            try {
+                if (trace_data.repulsion_sites.load_json(*repulsion_path)) {
+                    std::cout << "Loaded repulsion_sites from " << *repulsion_path << " ("
+                              << trace_data.repulsion_sites.sites().size() << " sites)\n";
+                }
+            } catch(...) { /* remain disabled */ }
+        }
+    }
 
     int w, h;
     if (resume_surf) {
@@ -1097,6 +1291,13 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         }
 
         trace_data.point_correction = PointCorrection(corrections);
+        if (trace_data.repulsion_sites.isValid()) {
+            // prepare grid_locs against the just-loaded dpoints
+            cv::Mat_<cv::Vec3f> dpoints_f; trace_params.dpoints.convertTo(dpoints_f, CV_32FC3);
+            trace_data.repulsion_sites.init_grid_locs(dpoints_f);
+            std::cout << "Repulsion sites mapped to grid: "
+                      << trace_data.repulsion_sites.sites().size() << std::endl;
+        }
 
         if (trace_data.point_correction.isValid()) {
             trace_data.point_correction.init(trace_params.dpoints);

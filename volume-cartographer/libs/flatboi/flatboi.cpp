@@ -31,9 +31,10 @@
 // OpenCV for compressed image writing
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
+#include <nlohmann/json.hpp>
 
 namespace fs = std::filesystem;
-
+using json = nlohmann::json;
 // ------------------------------
 // Minimal W&B pipe logger via temp Python file (no-op if python/wandb missing)
 // ------------------------------
@@ -294,6 +295,9 @@ struct Flatboi {
   Eigen::MatrixXd TC;         // #TC x 2
   Eigen::MatrixXi FTC;        // #F x 3
   bool have_per_corner_uv = false;
+  // Cache the "original" (pre-SLIM) per-vertex UV used as initial condition (for provenance)
+  Eigen::MatrixXd uv_ic_cache; // #V x 2
+  bool uv_ic_have = false;
 
   Flatboi(const std::string& obj_path, int max_iter_) : input_obj(obj_path), max_iter(max_iter_) {
     read_mesh();
@@ -427,6 +431,7 @@ struct Flatboi {
 
     if (initial_condition == "original") {
       original_ic(bnd, bnd_uv, uv);
+      uv_ic_cache = uv; uv_ic_have = true;
       auto [l2m, l2med, linf, area] = stretch_metrics(uv);
       std::cout << "Starting metrics from VC3D flattening -- "
                 << "L2(mean): " << l2m << ", L2(median): " << l2med
@@ -477,6 +482,177 @@ struct Flatboi {
     }
 
     return { data.V_o.leftCols<2>(), energies };
+  }
+
+  // ---------- Bad-region export ----------
+  struct TriMetrics {
+    double L2_rms=0, Linf=0, kappa=0, logA=0;
+    Eigen::Vector3d centroid;
+    Eigen::Matrix<double,3,2> uv_ic;   // original-IC UVs (per tri corner order)
+    Eigen::Matrix<double,3,2> uv_fin;  // final UVs (per tri corner order)
+  };
+
+  static double env_or(const char* k, double dflt){
+    if(const char* v = std::getenv(k)) { try { return std::stod(v);} catch(...){} }
+    return dflt;
+  }
+
+  std::vector<TriMetrics> compute_per_triangle_metrics(const Eigen::MatrixXd& uv_final) const {
+    std::vector<TriMetrics> out(F.rows());
+    for (int t=0; t<F.rows(); ++t) {
+      TriMetrics tm;
+      const Eigen::RowVector3d q1 = V.row(F(t,0));
+      const Eigen::RowVector3d q2 = V.row(F(t,1));
+      const Eigen::RowVector3d q3 = V.row(F(t,2));
+      const Eigen::RowVector2d p1f = uv_final.row(F(t,0));
+      const Eigen::RowVector2d p2f = uv_final.row(F(t,1));
+      const Eigen::RowVector2d p3f = uv_final.row(F(t,2));
+      if (uv_ic_have) {
+        tm.uv_ic.row(0) = uv_ic_cache.row(F(t,0));
+        tm.uv_ic.row(1) = uv_ic_cache.row(F(t,1));
+        tm.uv_ic.row(2) = uv_ic_cache.row(F(t,2));
+      } else {
+        tm.uv_ic.setZero();
+      }
+      tm.uv_fin.row(0) = p1f; tm.uv_fin.row(1) = p2f; tm.uv_fin.row(2) = p3f;
+      tm.centroid = 0.3333333333*(q1+q2+q3);
+
+      // reuse triangle_stretch for L2 & Linf; compute kappa & logA here
+      Eigen::Matrix<double,3,3> tri3d; tri3d << q1, q2, q3;
+      Eigen::Matrix<double,3,2> tri2d; tri2d << p1f, p2f, p3f;
+      double L2,G,A3,A2; triangle_stretch(tri3d,tri2d,L2,G,A3,A2);
+      tm.L2_rms=L2; tm.Linf=G;
+
+      // SVD/eigs of pullback metric via Ss,St:
+      const double s1=p1f[0], t1=p1f[1];
+      const double s2=p2f[0], t2=p2f[1];
+      const double s3=p3f[0], t3=p3f[1];
+      A2 = ((s2 - s1) * (t3 - t1) - (s3 - s1) * (t2 - t1)) / 2.0;
+      if (std::abs(A2)>1e-30) {
+        const Eigen::RowVector3d Ss = ( q1*(t2 - t3) + q2*(t3 - t1) + q3*(t1 - t2) ) / (2.0*A2);
+        const Eigen::RowVector3d St = ( q1*(s3 - s2) + q2*(s1 - s3) + q3*(s2 - s1) ) / (2.0*A2);
+        const double a = Ss.dot(Ss), b = Ss.dot(St), c = St.dot(St);
+        const double tr=a+c, disc=std::sqrt(std::max(0.0,(a-c)*(a-c)+4*b*b));
+        const double lam_max=0.5*(tr+disc), lam_min=0.5*(tr-disc);
+        const double smax=std::sqrt(std::max(0.0,lam_max));
+        const double smin=std::sqrt(std::max(0.0,lam_min));
+        tm.kappa = (smin>1e-30)? (smax/smin) : std::numeric_limits<double>::infinity();
+
+        const double ab = (q2 - q1).norm(), bc=(q3 - q2).norm(), ca=(q1 - q3).norm();
+        const double sp=0.5*(ab+bc+ca);
+        const double A3 = std::sqrt(std::max(0.0, sp*(sp-ab)*(sp-bc)*(sp-ca)));
+        const double area_factor = (std::abs(A2)>1e-30) ? (A3/std::abs(A2)) : 0.0;
+        tm.logA = std::log(std::max(1e-30, area_factor));
+      } else {
+        tm.kappa = 0; tm.logA=0;
+      }
+      out[t]=std::move(tm);
+    }
+    return out;
+  }
+
+    void write_bad_regions_json(const Eigen::MatrixXd& uv_final) const {
+    const double thK  = env_or("FLATBOI_BAD_KAPPA", 1.1);
+    const double thLi = env_or("FLATBOI_BAD_LINF",  1.1);
+    const double thL2 = env_or("FLATBOI_BAD_L2",    1.1);
+    const double thLA = env_or("FLATBOI_BAD_LOGA",  0.1);
+
+    // Median edge length (for cluster radius)
+    std::vector<double> el; el.reserve(F.rows()*3);
+    for (int t=0;t<F.rows();++t){
+      Eigen::RowVector3d a=V.row(F(t,0)), b=V.row(F(t,1)), c=V.row(F(t,2));
+      el.push_back((a-b).norm()); el.push_back((b-c).norm()); el.push_back((c-a).norm());
+    }
+    std::nth_element(el.begin(), el.begin()+el.size()/2, el.end());
+    const double med_edge = el.empty()? 1.0 : el[el.size()/2];
+    const double cluster_r = env_or("FLATBOI_CLUSTER_RADIUS_FACTOR", 2.5) * med_edge;
+    const double cluster_r2 = cluster_r*cluster_r;
+
+    auto pertri = compute_per_triangle_metrics(uv_final);
+
+    struct Node { int idx; Eigen::Vector3d c; };
+    std::vector<Node> bads;
+    bads.reserve(pertri.size()/10+1);
+    for (int t=0;t<(int)pertri.size();++t){
+      const auto& m=pertri[t];
+      if (m.kappa>=thK || m.Linf>=thLi || m.L2_rms>=thL2 || std::abs(m.logA)>=thLA){
+        bads.push_back({t, m.centroid});
+      }
+    }
+
+    // trivial single-link clustering by radius
+    std::vector<int> label(bads.size(), -1);
+    int ncl=0;
+    for (int i=0;i<(int)bads.size();++i){
+      if (label[i]!=-1) continue;
+      label[i]=ncl;
+      // expand
+      for (bool changed=true; changed; ){
+        changed=false;
+        for (int j=0;j<(int)bads.size();++j){
+          if (label[j]==-1){
+            for (int k=0;k<(int)bads.size();++k){
+              if (label[k]==ncl){
+                if ((bads[j].c - bads[k].c).squaredNorm() <= cluster_r2){
+                  label[j]=ncl; changed=true; break;
+                }
+              }
+            }
+          }
+        }
+      }
+      ++ncl;
+    }
+
+    json j;
+    j["mesh"] = input_obj;
+    j["thresholds"] = { {"kappa", thK}, {"linf", thLi}, {"l2", thL2}, {"logA_abs", thLA} };
+    j["cluster_radius"] = cluster_r;
+
+    // triangles
+    auto& jt = j["triangles"]; jt = json::array();
+    for (const auto& bn : bads){
+      const auto& m = pertri[bn.idx];
+      json t;
+      t["face"] = bn.idx;
+      t["centroid3d"] = { m.centroid[0], m.centroid[1], m.centroid[2] };
+      t["metrics"] = { {"kappa", m.kappa}, {"linf", m.Linf}, {"l2", m.L2_rms}, {"logA", m.logA} };
+      if (uv_ic_have){
+        t["uv_original"] = { 
+          { m.uv_ic(0,0), m.uv_ic(0,1) },
+          { m.uv_ic(1,0), m.uv_ic(1,1) },
+          { m.uv_ic(2,0), m.uv_ic(2,1) }
+        };
+      }
+      t["uv_final"] = {
+        { m.uv_fin(0,0), m.uv_fin(0,1) },
+        { m.uv_fin(1,0), m.uv_fin(1,1) },
+        { m.uv_fin(2,0), m.uv_fin(2,1) }
+      };
+      jt.push_back(std::move(t));
+    }
+
+    // clusters
+    auto& jc = j["clusters"]; jc = json::array();
+    for (int c=0;c<ncl;++c){
+      Eigen::Vector3d mu(0,0,0); int cnt=0;
+      for (int i=0;i<(int)bads.size();++i) if (label[i]==c){ mu += bads[i].c; ++cnt; }
+      if (cnt==0) continue;
+      mu /= double(cnt);
+      json cl; cl["center3d"] = { mu[0], mu[1], mu[2] };
+      cl["count"] = cnt;
+      cl["radius"] = cluster_r;
+      jc.push_back(std::move(cl));
+    }
+
+    fs::path out = fs::path(input_obj).parent_path() / (fs::path(input_obj).stem().string() + "_flatboi_bad.json");
+    std::ofstream os(out);
+    if (os) {
+      os << j.dump(2) << std::endl;
+      std::cout << "Wrote bad-region JSON: " << out << "\n";
+    } else {
+      std::cerr << "Failed to write bad-region JSON: " << out << "\n";
+    }
   }
 
   void save_obj(const Eigen::MatrixXd& uv) const {
@@ -851,6 +1027,8 @@ int main(int argc, char** argv) {
     // Persist
     save_energies(obj_path, energies);
     fb.save_obj(uv_out);
+    // Bad-region JSON for feedback loop
+    try { fb.write_bad_regions_json(uv_out); } catch(...) {}
 
     // Heatmaps (post-SLIM) via OpenCV PNG + log them if W&B is available
     auto paths = fb.save_uv_heatmaps(uv_out);

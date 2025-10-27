@@ -12,7 +12,6 @@ from pathlib import Path
 from dataclasses import dataclass
 from collections import defaultdict
 from typing import List, Dict, Tuple, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed  # thread pool (safe with subprocess)
 
 # -------------------------------
 # Logging
@@ -394,8 +393,7 @@ class SurfaceTracerEvaluation:
             param_files[fv] = pf
 
         trace_paths: List[Path] = []
-        max_workers = int(self.config.get("tracer_parallel_processes", 1))
-        logger.info(f"Tracing with up to {max_workers} parallel processes")
+        logger.info("Tracing sequentially (parallelism disabled)")
         base_env = self._exec_env()
 
         def _run_one(source_patch: PatchInfo, tracer_params_file: Path, run_tag: str) -> Optional[Path]:
@@ -442,24 +440,17 @@ class SurfaceTracerEvaluation:
             logger.info(f"Selected final trace {final_td.name} for patch {source_patch.path.name} ({run_tag})")
             return final_td
 
-        def _run_both_flips(patch_info: PatchInfo) -> List[Path]:
-            # Serialize fx0 and fx1 for the SAME source patch to avoid races on its artifacts
-            outs: List[Path] = []
-            for fv, pf in param_files.items():
+        # Strictly sequential: iterate patches, and for each patch run fx0 then fx1.
+        for patch_info in source_patches:
+            for fv in (False, True):  # deterministic order
+                pf = param_files[fv]
                 tag = f"fx{int(fv)}"
-                res = _run_one(patch_info, pf, tag)
-                if res:
-                    outs.append(res)
-            return outs
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(_run_both_flips, pi) for pi in source_patches]
-            for fut in as_completed(futures):
                 try:
-                    for p in fut.result() or []:
-                        trace_paths.append(p)
+                    res = _run_one(patch_info, pf, tag)
+                    if res:
+                        trace_paths.append(res)
                 except Exception as e:
-                    logger.error(f"Error in tracer run: {e}")
+                    logger.error(f"Error in tracer run for {patch_info.path.name} ({tag}): {e}")
 
         logger.info(f"Created {len(trace_paths)} valid traces")
         return trace_paths

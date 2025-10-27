@@ -396,13 +396,17 @@ class SurfaceTracerEvaluation:
         trace_paths: List[Path] = []
         max_workers = int(self.config.get("tracer_parallel_processes", 1))
         logger.info(f"Tracing with up to {max_workers} parallel processes")
-        env = self._exec_env()
+        base_env = self._exec_env()
 
         def _run_one(source_patch: PatchInfo, tracer_params_file: Path, run_tag: str) -> Optional[Path]:
             ts = time.time_ns()
             tag = f"_{run_tag}" if run_tag else ""
             run_traces_dir = self.traces_dir / f"from_{source_patch.path.name}{tag}_{ts}"
             run_traces_dir.mkdir(exist_ok=True)
+
+            # Per-run env to prevent temp-file collisions across processes
+            env = base_env.copy()
+            env.setdefault("TMPDIR", str(run_traces_dir))
 
             cmd = [
                 str(self.bin_dir / "vc_grow_seg_from_segments"),
@@ -417,10 +421,12 @@ class SurfaceTracerEvaluation:
             result = subprocess.run(cmd, env=env, capture_output=True, text=True)
             logger.info(f"Finished vc_grow_seg_from_segments run (return code {result.returncode})")
             if result.returncode != 0:
+                # Treat as failure; refuse partial artifacts to avoid "surface is empty" later
                 if result.stdout:
                     logger.error(f"vc_grow_seg_from_segments STDOUT:\n{result.stdout}")
                 if result.stderr:
                     logger.error(f"vc_grow_seg_from_segments STDERR:\n{result.stderr}")
+                return None
 
             # Pick the last valid trace under run_traces_dir
             candidates = []
@@ -436,18 +442,22 @@ class SurfaceTracerEvaluation:
             logger.info(f"Selected final trace {final_td.name} for patch {source_patch.path.name} ({run_tag})")
             return final_td
 
-        futures = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for patch_info in source_patches:
-                for fv, pf in param_files.items():
-                    tag = f"fx{int(fv)}"
-                    futures.append(executor.submit(_run_one, patch_info, pf, tag))
+        def _run_both_flips(patch_info: PatchInfo) -> List[Path]:
+            # Serialize fx0 and fx1 for the SAME source patch to avoid races on its artifacts
+            outs: List[Path] = []
+            for fv, pf in param_files.items():
+                tag = f"fx{int(fv)}"
+                res = _run_one(patch_info, pf, tag)
+                if res:
+                    outs.append(res)
+            return outs
 
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_run_both_flips, pi) for pi in source_patches]
             for fut in as_completed(futures):
                 try:
-                    res = fut.result()
-                    if res:
-                        trace_paths.append(res)
+                    for p in fut.result() or []:
+                        trace_paths.append(p)
                 except Exception as e:
                     logger.error(f"Error in tracer run: {e}")
 

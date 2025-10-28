@@ -11,7 +11,7 @@ from statistics import median
 from pathlib import Path
 from dataclasses import dataclass
 from collections import defaultdict
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Iterable
 
 # -------------------------------
 # Logging
@@ -80,6 +80,18 @@ class SurfaceTracerEvaluation:
     @staticmethod
     def _is_finite_number(x) -> bool:
         return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+    @staticmethod
+    def _has_nonempty_tifxyz(td: Path, min_bytes: int = 1024) -> bool:
+        """
+        Return True iff x/y/z.tif exist and are non-trivial in size.
+        A small threshold avoids selecting empty placeholder files.
+        """
+        try:
+            sizes = [(td / f).stat().st_size for f in ("x.tif", "y.tif", "z.tif")]
+        except FileNotFoundError:
+            return False
+        return all(s >= min_bytes for s in sizes)
 
     def _robust_threshold(self, durations: List[float]) -> Optional[float]:
         """
@@ -155,6 +167,9 @@ class SurfaceTracerEvaluation:
         env = self._exec_env()
         log_path = self.proc_logs_dir / f"seed_{idx}_{int(time.time())}.log"
         logf = open(log_path, "wb")
+        tmpdir = self.out_dir / "tmp" / f"seed_{idx}_{int(time.time_ns())}"
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        env.setdefault("TMPDIR", str(tmpdir))
         cmd = [
             str(self.bin_dir / "vc_grow_seg_from_seed"),
             self.config["surface_zarr_volume"],
@@ -171,6 +186,9 @@ class SurfaceTracerEvaluation:
         env = self._exec_env()
         log_path = self.proc_logs_dir / f"expand_{idx}_{int(time.time())}.log"
         logf = open(log_path, "wb")
+        tmpdir = self.out_dir / "tmp" / f"seed_{idx}_{int(time.time_ns())}"
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        env.setdefault("TMPDIR", str(tmpdir))
         cmd = [
             str(self.bin_dir / "vc_grow_seg_from_seed"),
             self.config["surface_zarr_volume"],
@@ -427,15 +445,21 @@ class SurfaceTracerEvaluation:
                 return None
 
             # Pick the last valid trace under run_traces_dir
-            candidates = []
+            candidates: List[Path] = []
             for td in run_traces_dir.iterdir():
                 if td.is_dir() and not td.name.endswith("_opt"):
                     if all((td / fname).exists() for fname in ("meta.json", "x.tif", "y.tif", "z.tif")):
-                        candidates.append(td)
+                        if self._has_nonempty_tifxyz(td):
+                            candidates.append(td)
+                        else:
+                            logger.debug(f"Discarding empty tifXYZ in {td.name}")
             if not candidates:
                 logger.warning(f"No trace produced starting from patch {source_patch.path.name} ({run_tag})")
                 return None
-            candidates.sort(key=lambda p: p.name)
+            # Prefer the largest sum(x,y,z).stat().st_size
+            def _payload_bytes(td: Path) -> int:
+                return sum((td / f).stat().st_size for f in ("x.tif", "y.tif", "z.tif"))
+            final_td = max(candidates, key=_payload_bytes)
             final_td = candidates[-1]
             logger.info(f"Selected final trace {final_td.name} for patch {source_patch.path.name} ({run_tag})")
             return final_td
@@ -460,10 +484,15 @@ class SurfaceTracerEvaluation:
     # -------------------------------
     def run_winding_numbers(self, traces: List[Path]) -> List[Path]:
         logger.info(f"Running vc_tifxyz_winding for {len(traces)} traces")
-        env = self._exec_env()
+        env_base = self._exec_env()
 
         successful = []
         for trace_dir in traces:
+            if not self._has_nonempty_tifxyz(trace_dir):
+                logger.error(f"Skipping winding: tifXYZ empty in {trace_dir.name}")
+                continue
+            env = env_base.copy()
+            env.setdefault("TMPDIR", str(trace_dir))
             cmd = [str(self.bin_dir / "vc_tifxyz_winding"), "."]
             logger.info(f"Starting vc_tifxyz_winding for {trace_dir.name}")
             result = subprocess.run(cmd, cwd=trace_dir, env=env, capture_output=True, text=True)

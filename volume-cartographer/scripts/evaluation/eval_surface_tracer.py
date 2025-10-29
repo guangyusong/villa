@@ -1,4 +1,44 @@
 #!/usr/bin/env python3
+"""
+Surface tracer evaluation harness
+
+This script orchestrates a multi-stage pipeline:
+
+  1) Seed discovery
+  2) Seeding (process-managed with a watchdog)
+  3) Expansion (process-managed with a watchdog)
+  4) Patch selection for tracing
+  5) Tracing (two flip_x variants per patch)
+  6) Winding number computation
+  7) Metrics calculation
+  8) Optional W&B logging (scalar-only) + watchdog kill counters
+
+Key reliability fixes in this version:
+
+  • Every subprocess gets a UNIQUE scratch directory (TMPDIR) under out/scratch.
+    We always override TMPDIR (do NOT use setdefault) to avoid inheriting a
+    global /tmp consumed by other jobs. Temp files are never mixed into the
+    patches/traces output trees, which prevents the “surface is empty” cascade.
+
+  • Low-thread environment is enforced for all subprocesses: OMP, MKL, OPENBLAS,
+    NUMEXPR are pinned to 1, preventing BLAS storms that starve sibling procs.
+
+  • Run/traces directories use high-resolution timestamps (time_ns) to prevent
+    collisions under concurrency.
+
+  • We only select traces that contain a COMPLETE and NON-ZERO tifXYZ + meta.json,
+    and we prefer the MOST RECENT (by file mtimes) trace, not the largest-on-disk.
+    Compression makes “best” traces often smaller; largest-bytes is misleading.
+
+  • Non-empty threshold is now > 0 bytes (was 1024), so we don’t reject valid,
+    small or highly-compressed tiles.
+
+  • Watchdog uses the same isolated scratch pattern and logs stdout/stderr on
+    failures. Expansion tmp naming corrected.
+
+See inline comments for the rationale behind each step.
+"""
+
 import os
 import json
 import time
@@ -28,15 +68,7 @@ class PatchInfo:
 
 class SurfaceTracerEvaluation:
     """
-    End-to-end harness:
-      1) Discover seeds
-      2) Seeding (watchdog-enabled)
-      3) Expansion (watchdog-enabled)
-      4) Select starting patches
-      5) Tracing (both flip_x variants, parallel)
-      6) Winding numbers
-      7) Metrics
-      8) W&B summary (plus watchdog kill counters)
+    End-to-end harness (see module docstring for overview).
     """
 
     def __init__(self, config_path: str):
@@ -44,54 +76,97 @@ class SurfaceTracerEvaluation:
             self.config = json.load(f)
         self.config_path = Path(config_path)
 
+        # Output roots
         self.out_dir = Path(self.config["out_path"])
         self.out_dir.mkdir(parents=True, exist_ok=True)
+
         self.patches_dir = self.out_dir / "patches"
         self.traces_dir = self.out_dir / "traces"
         self.patches_dir.mkdir(exist_ok=self.config["use_existing_patches"])
         self.traces_dir.mkdir(exist_ok=True)
 
-        # Per-process logs (for seeding/expansion watchdog)
+        # Dedicated process logs (stdout/stderr per child process)
         self.proc_logs_dir = self.out_dir / "proc_logs"
         self.proc_logs_dir.mkdir(exist_ok=True)
+
+        # Dedicated scratch root for TMPDIR (unique per child)
+        # NOTE: Scratch must never be inside traces/patches to avoid confusing scanners.
+        self.scratch_dir = self.out_dir / "scratch"
+        self.scratch_dir.mkdir(exist_ok=True)
 
         # Resolve bin dir once (stable absolute paths for all tools)
         self.bin_dir = Path(self.config["bin_path"]).resolve()
 
         # Watchdog controls (overridable in config)
-        self._watch_check_period = int(self.config.get("watchdog_check_period_sec", 1800))  # 30 min
+        self._watch_check_period = int(self.config.get("watchdog_check_period_sec", 1800))  # default: 30 min
         self._watch_trigger_fraction = float(self.config.get("watchdog_trigger_fraction", 0.8))
-        self._watch_min_samples = int(self.config.get("watchdog_min_samples", 12))
+        self._watch_min_samples = int(self.config.get("watchdog_min_samples", 12))  # retained for compatibility
         self._watch_grace_seconds = int(self.config.get("watchdog_grace_seconds", 30))
 
+        # Watchdog kill counters (included in W&B summary if enabled)
         self.watchdog_kills = {"seeding": 0, "expansion": 0}
 
     # -------------------------------
     # Helpers
     # -------------------------------
     def _exec_env(self) -> Dict[str, str]:
+        """
+        Return a copy of os.environ with deterministic low-thread settings.
+        IMPORTANT: we intentionally override (not setdefault) to guarantee stability.
+        """
         env = os.environ.copy()
-        env.setdefault("OMP_NUM_THREADS", "1")
-        env.setdefault("OPENBLAS_NUM_THREADS", "1")
-        env.setdefault("MKL_NUM_THREADS", "1")
-        env.setdefault("NUMEXPR_NUM_THREADS", "1")
+        env["OMP_NUM_THREADS"] = "1"
+        env["OPENBLAS_NUM_THREADS"] = "1"
+        env["MKL_NUM_THREADS"] = "1"
+        env["NUMEXPR_NUM_THREADS"] = "1"
         return env
+
+    def _unique_tmp(self, tag: str) -> Path:
+        """
+        Create a unique scratch directory under out/scratch and return its path.
+        The tag helps identify the stage (seed/expand/trace/winding/metrics).
+        """
+        tmp = self.scratch_dir / f"{tag}_{int(time.time_ns())}"
+        tmp.mkdir(parents=True, exist_ok=True)
+        return tmp
 
     @staticmethod
     def _is_finite_number(x) -> bool:
         return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
     @staticmethod
-    def _has_nonempty_tifxyz(td: Path, min_bytes: int = 1024) -> bool:
+    def _has_nonempty_tifxyz(td: Path, min_bytes: int = 1) -> bool:
         """
-        Return True iff x/y/z.tif exist and are non-trivial in size.
-        A small threshold avoids selecting empty placeholder files.
+        Return True iff x/y/z.tif exist and are non-zero in size.
+        We purposely only require > 0 bytes. Valid traces can be small/very compressible.
         """
         try:
             sizes = [(td / f).stat().st_size for f in ("x.tif", "y.tif", "z.tif")]
         except FileNotFoundError:
             return False
-        return all(s >= min_bytes for s in sizes)
+        return all(s > 0 for s in sizes)
+
+    @staticmethod
+    def _trace_complete(td: Path) -> bool:
+        """
+        A "complete" trace directory has meta.json and non-empty tifXYZ.
+        """
+        if not (td / "meta.json").exists():
+            return False
+        return SurfaceTracerEvaluation._has_nonempty_tifxyz(td)
+
+    @staticmethod
+    def _trace_mtime(td: Path) -> float:
+        """
+        Representative mtime for a trace directory: max mtime across the key files.
+        Used to pick the newest "complete" candidate.
+        """
+        mtimes = []
+        for f in ("meta.json", "x.tif", "y.tif", "z.tif"):
+            p = td / f
+            if p.exists():
+                mtimes.append(p.stat().st_mtime)
+        return max(mtimes) if mtimes else 0.0
 
     def _robust_threshold(self, durations: List[float]) -> Optional[float]:
         """
@@ -111,6 +186,12 @@ class SurfaceTracerEvaluation:
     # Seed discovery
     # -------------------------------
     def find_seed_points(self) -> List[Tuple[float, float, float]]:
+        """
+        Discover seed points from either:
+          • a JSON file with seeds grouped by mode, taking "explicit_seed"
+          • a directory of patch subfolders with meta.json containing vc_gsfs_mode == explicit_seed
+        Always filters seeds by z-range from config.
+        """
         patches_path = Path(self.config["existing_patches_for_seeds"])
         z_min, z_max = self.config["z_range"]
 
@@ -164,12 +245,16 @@ class SurfaceTracerEvaluation:
     # Seeding / Expansion (watchdog Popen manager)
     # -------------------------------
     def _launch_seed_proc(self, seeding_params_file: Path, seed_point: Tuple[float, float, float], idx: int):
+        """
+        Launch a single seeding process with its own logfile and scratch TMPDIR.
+        """
         env = self._exec_env()
-        log_path = self.proc_logs_dir / f"seed_{idx}_{int(time.time())}.log"
+        # Unique logfile and scratch
+        log_path = self.proc_logs_dir / f"seed_{idx}_{int(time.time_ns())}.log"
         logf = open(log_path, "wb")
-        tmpdir = self.out_dir / "tmp" / f"seed_{idx}_{int(time.time_ns())}"
-        tmpdir.mkdir(parents=True, exist_ok=True)
-        env.setdefault("TMPDIR", str(tmpdir))
+        tmpdir = self._unique_tmp(f"seed_{idx}")
+        env["TMPDIR"] = str(tmpdir)  # FORCE override
+
         cmd = [
             str(self.bin_dir / "vc_grow_seg_from_seed"),
             self.config["surface_zarr_volume"],
@@ -183,12 +268,15 @@ class SurfaceTracerEvaluation:
         return {"p": p, "start": time.time(), "logf": logf, "idx": idx}
 
     def _launch_expand_proc(self, expansion_params_file: Path, idx: int):
+        """
+        Launch a single expansion process with its own logfile and scratch TMPDIR.
+        """
         env = self._exec_env()
-        log_path = self.proc_logs_dir / f"expand_{idx}_{int(time.time())}.log"
+        log_path = self.proc_logs_dir / f"expand_{idx}_{int(time.time_ns())}.log"
         logf = open(log_path, "wb")
-        tmpdir = self.out_dir / "tmp" / f"seed_{idx}_{int(time.time_ns())}"
-        tmpdir.mkdir(parents=True, exist_ok=True)
-        env.setdefault("TMPDIR", str(tmpdir))
+        tmpdir = self._unique_tmp(f"expand_{idx}")
+        env["TMPDIR"] = str(tmpdir)  # FORCE override
+
         cmd = [
             str(self.bin_dir / "vc_grow_seg_from_seed"),
             self.config["surface_zarr_volume"],
@@ -200,8 +288,8 @@ class SurfaceTracerEvaluation:
 
     def _run_watchdog_loop(
         self,
-        tasks,  # list of (idx, payload) or idx
-        launcher,  # function to create a proc dict
+        tasks,      # list of (idx, payload) or idx
+        launcher,   # function to create a proc dict
         parallel: int,
         stage_key: str,
     ) -> int:
@@ -226,13 +314,13 @@ class SurfaceTracerEvaluation:
                 pass
 
         while tasks or active:
-            # fill slots
+            # Fill available slots up to 'parallel'
             while tasks and len(active) < parallel:
                 item = tasks.pop(0)
                 t = launcher(item[0], item[1]) if isinstance(item, tuple) else launcher(item)
                 active.append(t)
 
-            # poll actives
+            # Poll actives
             now = time.time()
             still = []
             for t in active:
@@ -248,6 +336,7 @@ class SurfaceTracerEvaluation:
                     successful_runs += 1
             active = still
 
+            # Periodic status
             if now - last_status >= status_period:
                 progress_total = (completed / total) if total > 0 else 0.0
                 logger.info(
@@ -257,7 +346,7 @@ class SurfaceTracerEvaluation:
                 )
                 last_status = now
 
-            # Watchdog: only after the requested fraction of the TOTAL work is completed
+            # Watchdog: only after the requested fraction of TOTAL work is done
             trigger_completed = max(1, math.ceil(total * self._watch_trigger_fraction))
             if completed >= trigger_completed:
                 if not watch_armed_logged:
@@ -286,11 +375,7 @@ class SurfaceTracerEvaluation:
                                         t["p"].wait(self._watch_grace_seconds)
                                     except subprocess.TimeoutExpired:
                                         t["p"].kill()
-                                    # Close per-proc logfile after termination
-                                    try:
-                                        t["logf"].close()
-                                    except Exception:
-                                        pass
+                                    _close_logf(t)
                                     kills += 1
                                 except Exception as e:
                                     logger.warning(f"[watchdog] terminate failed: {e}")
@@ -304,6 +389,10 @@ class SurfaceTracerEvaluation:
         return successful_runs
 
     def run_seeding(self, seed_points: List[Tuple[float, float, float]]) -> List[Path]:
+        """
+        Run vc_grow_seg_from_seed for explicit seeds with watchdog supervision,
+        then harvest any patch directories created under patches_dir.
+        """
         logger.info(f"Running vc_grow_seg_from_seed seeding for {len(seed_points)} seed points")
 
         seeding_params = self.config["vc_grow_seg_from_seed_params"]["seeding"].copy()
@@ -315,9 +404,15 @@ class SurfaceTracerEvaluation:
         max_num = int(self.config.get("max_num_seeds", len(seed_points)))
         parallel = int(self.config["seeding_parallel_processes"])
         tasks = [(i, sp) for i, sp in enumerate(seed_points[:max_num])]
-        successful = self._run_watchdog_loop(tasks, lambda idx, sp: self._launch_seed_proc(seeding_params_file, sp, idx), parallel, "seeding")
 
-        # Collect all created patches from patches directory
+        successful = self._run_watchdog_loop(
+            tasks,
+            lambda idx, sp: self._launch_seed_proc(seeding_params_file, sp, idx),
+            parallel,
+            "seeding",
+        )
+
+        # Collect all created patches from patches directory (meta.json is the marker)
         created_patches = []
         for patch_dir in self.patches_dir.iterdir():
             if patch_dir.is_dir() and (patch_dir / "meta.json").exists():
@@ -327,6 +422,10 @@ class SurfaceTracerEvaluation:
         return created_patches
 
     def run_expansion(self, existing_patches: List[Path]) -> List[Path]:
+        """
+        Run vc_grow_seg_from_seed in expansion mode N times with watchdog supervision,
+        then return only the *new* patch directories (not in existing_patches).
+        """
         num_expansion_patches = int(self.config.get("num_expansion_patches", 1))
         logger.info(f"Running vc_grow_seg_from_seed in expansion mode {num_expansion_patches} times")
 
@@ -338,7 +437,10 @@ class SurfaceTracerEvaluation:
 
         parallel = int(self.config.get("expansion_parallel_processes", self.config.get("seeding_parallel_processes", 1)))
         tasks = list(range(num_expansion_patches))
-        successful = self._run_watchdog_loop(tasks, lambda idx: self._launch_expand_proc(expansion_params_file, idx), parallel, "expansion")
+
+        successful = self._run_watchdog_loop(
+            tasks, lambda idx: self._launch_expand_proc(expansion_params_file, idx), parallel, "expansion"
+        )
 
         # Collect new patches created by expansion runs
         all_patches = []
@@ -354,31 +456,37 @@ class SurfaceTracerEvaluation:
     # Patch selection for tracing
     # -------------------------------
     def get_trace_starting_patches(self, patches: List[Path]) -> List[PatchInfo]:
+        """
+        Read meta.json for each patch, compute areas, filter by min_size,
+        then select num_trace_starting_patches patches either via 'top_k' or
+        evenly spaced 'quantiles' selection strategy.
+        """
         patch_infos = []
         for patch_dir in patches:
             try:
-                meta = json.load(open(patch_dir / "meta.json"))
+                with open(patch_dir / "meta.json", "r") as f:
+                    meta = json.load(f)
                 area = float(meta.get("area_vx2", 0.0) or 0.0)
                 patch_infos.append(PatchInfo(path=patch_dir, area=area))
             except Exception as e:
                 logger.warning(f"Error reading meta.json from {patch_dir}: {e}")
                 continue
-    
+
         min_size = float(self.config.get("min_trace_starting_patch_size", 0.0))
         filtered = [p for p in patch_infos if p.area >= min_size]
         if not filtered:
             logger.warning(f"No patches found with area >= {min_size}")
             return []
-    
+
         k = max(0, int(self.config.get("num_trace_starting_patches", 1)))
         filtered.sort(key=lambda p: p.area, reverse=True)
         n = len(filtered)
-    
+
         if k <= 1:
             return filtered[:min(1, n)]
         if k >= n:
             return filtered
-    
+
         # selection strategy: "quantiles" (default) or "top_k"
         strategy = str(self.config.get("trace_starting_selection", "quantiles")).lower()
         if strategy == "top_k":
@@ -388,14 +496,21 @@ class SurfaceTracerEvaluation:
         idxs = [(i * (n - 1)) // (k - 1) for i in range(k)]
         return [filtered[i] for i in idxs]
 
-
     # -------------------------------
     # Tracing (both flip_x variants)
     # -------------------------------
     def run_tracer(self, source_patches: List[PatchInfo]) -> List[Path]:
+        """
+        For each source patch, run vc_grow_seg_from_segments twice:
+          • flip_x = 0
+          • flip_x = 1
+        We run sequentially for determinism and simpler resource behavior.
+        Each run writes into its own run_traces_dir and uses an isolated TMPDIR
+        under out/scratch to avoid temp-file collisions.
+        """
         logger.info(f"Running vc_grow_seg_from_segments (both flip_x variants) for {len(source_patches)} source patches")
 
-        # Base params
+        # Base params (optionally inject z_range)
         base_params = self.config["vc_grow_seg_from_segments_params"].copy()
         if "z_range" in self.config:
             base_params["z_range"] = self.config["z_range"]
@@ -415,6 +530,10 @@ class SurfaceTracerEvaluation:
         base_env = self._exec_env()
 
         def _run_one(source_patch: PatchInfo, tracer_params_file: Path, run_tag: str) -> Optional[Path]:
+            """
+            Launch one vc_grow_seg_from_segments run with its own output folder and scratch.
+            Select the *newest* complete trace (by mtime) from within that run's directory.
+            """
             ts = time.time_ns()
             tag = f"_{run_tag}" if run_tag else ""
             run_traces_dir = self.traces_dir / f"from_{source_patch.path.name}{tag}_{ts}"
@@ -422,7 +541,7 @@ class SurfaceTracerEvaluation:
 
             # Per-run env to prevent temp-file collisions across processes
             env = base_env.copy()
-            env.setdefault("TMPDIR", str(run_traces_dir))
+            env["TMPDIR"] = str(self._unique_tmp(f"trace_{source_patch.path.name}_{run_tag}"))
 
             cmd = [
                 str(self.bin_dir / "vc_grow_seg_from_segments"),
@@ -444,22 +563,18 @@ class SurfaceTracerEvaluation:
                     logger.error(f"vc_grow_seg_from_segments STDERR:\n{result.stderr}")
                 return None
 
-            # Pick the last valid trace under run_traces_dir
+            # Enumerate candidate traces: require complete tifXYZ + meta.json, ignore *_opt folders
             candidates: List[Path] = []
             for td in run_traces_dir.iterdir():
-                if td.is_dir() and not td.name.endswith("_opt"):
-                    if all((td / fname).exists() for fname in ("meta.json", "x.tif", "y.tif", "z.tif")):
-                        if self._has_nonempty_tifxyz(td):
-                            candidates.append(td)
-                        else:
-                            logger.debug(f"Discarding empty tifXYZ in {td.name}")
+                if td.is_dir() and not td.name.endswith("_opt") and self._trace_complete(td):
+                    candidates.append(td)
+
             if not candidates:
                 logger.warning(f"No trace produced starting from patch {source_patch.path.name} ({run_tag})")
                 return None
-            # Prefer the largest sum(x,y,z).stat().st_size
-            def _payload_bytes(td: Path) -> int:
-                return sum((td / f).stat().st_size for f in ("x.tif", "y.tif", "z.tif"))
-            final_td = max(candidates, key=_payload_bytes)
+
+            # Prefer the newest by mtime across key files; tie-break by folder name for determinism.
+            candidates.sort(key=lambda td: (self._trace_mtime(td), td.name))
             final_td = candidates[-1]
             logger.info(f"Selected final trace {final_td.name} for patch {source_patch.path.name} ({run_tag})")
             return final_td
@@ -483,16 +598,20 @@ class SurfaceTracerEvaluation:
     # Winding numbers
     # -------------------------------
     def run_winding_numbers(self, traces: List[Path]) -> List[Path]:
+        """
+        Run vc_tifxyz_winding within each trace directory.
+        Preflight ensures we never call winding on an incomplete/empty trace.
+        """
         logger.info(f"Running vc_tifxyz_winding for {len(traces)} traces")
         env_base = self._exec_env()
 
         successful = []
         for trace_dir in traces:
-            if not self._has_nonempty_tifxyz(trace_dir):
-                logger.error(f"Skipping winding: tifXYZ empty in {trace_dir.name}")
+            if not self._trace_complete(trace_dir):
+                logger.error(f"Skipping winding: incomplete or empty tifXYZ in {trace_dir.name}")
                 continue
             env = env_base.copy()
-            env.setdefault("TMPDIR", str(trace_dir))
+            env["TMPDIR"] = str(self._unique_tmp(f"winding_{trace_dir.name}"))
             cmd = [str(self.bin_dir / "vc_tifxyz_winding"), "."]
             logger.info(f"Starting vc_tifxyz_winding for {trace_dir.name}")
             result = subprocess.run(cmd, cwd=trace_dir, env=env, capture_output=True, text=True)
@@ -514,6 +633,9 @@ class SurfaceTracerEvaluation:
     # Metrics
     # -------------------------------
     def run_metrics(self, traces: List[Path]) -> Dict[Path, Dict]:
+        """
+        Run vc_calc_surface_metrics for each trace with winding.tif present.
+        """
         logger.info(f"Running vc_calc_surface_metrics for {len(traces)} traces")
         env = self._exec_env()
 
@@ -536,6 +658,8 @@ class SurfaceTracerEvaluation:
                 "--z_max",
                 str(z_range[1]),
             ]
+            # Isolate metrics temp as well (cheap + consistent)
+            env["TMPDIR"] = str(self._unique_tmp(f"metrics_{trace_dir.name}"))
             result = subprocess.run(cmd, env=env, capture_output=True, text=True)
             if result.returncode == 0 and metrics_file.exists():
                 try:
@@ -575,6 +699,10 @@ class SurfaceTracerEvaluation:
         return safe
 
     def collate_and_log_metrics(self, metrics_results: Dict[Path, Dict]):
+        """
+        Build scalar means across the top-K (by ranking metric) traces and, if configured,
+        log them to Weights & Biases along with watchdog kill counters.
+        """
         logger.info("Collating metrics and logging to wandb")
 
         # Prepare scalar summary (may be empty if no metrics)
@@ -661,10 +789,9 @@ class SurfaceTracerEvaluation:
                     mode=self.config.get("wandb_mode", "online"),
                 )
 
-                # Build final W&B run name = Argo workflow name (exported as env)
+                # Derive an informative run name
                 run_name = os.environ.get("VC3D_RUN_NAME")
                 if not run_name:
-                    # Fallback: derive from config filename + tags (sanitized)
                     def _clean(s: str) -> str:
                         return "".join(ch if (ch.isalnum() or ch == "-") else "-" for ch in s.lower()).strip("-")
 
@@ -705,6 +832,13 @@ class SurfaceTracerEvaluation:
     # Driver
     # -------------------------------
     def run(self):
+        """
+        Main orchestration:
+          • Optionally use existing patches (if configured) or run seeding+expansion
+          • Choose starting patches
+          • Run tracer, winding, metrics
+          • Collate metrics and optionally log to W&B
+        """
         try:
             if self.config.get("use_existing_patches", False):
                 existing_patches = []
